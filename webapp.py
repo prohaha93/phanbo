@@ -505,9 +505,6 @@ if uploaded_file is not None:
                 col2.metric("Số lượng Time Slots", f"{len(mh_order)}")
                 col3.metric("Số lượng Clash (Trùng lặp)", f"{n_clash} lỗi", delta_color="inverse")
                 
-                st.write("### 📊 Xem trước kết quả (50 dòng đầu):")
-                st.dataframe(df_result.head(50), use_container_width=True)
-
                 st.download_button(
                     label="📥 TẢI FILE EXCEL KẾT QUẢ ĐẦY ĐỦ",
                     data=excel_buffer,
@@ -517,4 +514,5 @@ if uploaded_file is not None:
                 )
 
             except Exception as e:
+
                 st.error(f"❌ Có lỗi xảy ra trong quá trình đọc file.\n\nChi tiết lỗi: {e}")
