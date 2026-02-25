@@ -28,7 +28,7 @@ C_WHITE  = 'FFFFFF'
 C_GREY   = 'BFBFBF'
 
 # ==========================================
-# CÁC HÀM XỬ LÝ DỮ LIỆU CHÍNH
+# CÁC HÀM XỬ LÝ DỮ LIỆU CHÍNH (Đã cập nhật thuật toán mới)
 # ==========================================
 def parse_input(input_file):
     xls = pd.ExcelFile(input_file)
@@ -89,6 +89,14 @@ def parse_input(input_file):
 
 def run_optimization(demand, mh_order, blocks, bwc):
     def score(wcs, b):
+        """
+        Block chỉ được chọn nếu có capacity > 0 cho TẤT CẢ WC có demand.
+        Score = tổng block_qty tại các WC có demand.
+        Trả về 0 nếu block không cover đủ tất cả WC -> không được chọn.
+        """
+        for wc, qty in wcs.items():
+            if qty > 0 and bwc[b].get(wc, 0) == 0:
+                return 0   # block không phù hợp với WC này
         return sum(bwc[b].get(wc, 0) for wc in wcs if wcs[wc] > 0)
 
     results = []
@@ -107,7 +115,13 @@ def run_optimization(demand, mh_order, blocks, bwc):
                 assign[(sts, bay)] = (best_block, False)   
                 used.add(best_block)
             else:
-                all_candidates = sorted([(score(wcs, b), b) for b in blocks], reverse=True)
+                # Không còn block trống phù hợp → CLASH
+                # Dùng partial score (bỏ qua ràng buộc all-WC) để chọn block ít tệ nhất
+                partial = lambda b: sum(bwc[b].get(wc, 0) for wc in wcs if wcs[wc] > 0)
+                all_candidates = sorted(
+                    [(partial(b), b) for b in blocks],
+                    reverse=True
+                )
                 best_block = all_candidates[0][1] if all_candidates else 'NO_MATCH'
                 assign[(sts, bay)] = (best_block, True)    
 
@@ -120,7 +134,7 @@ def run_optimization(demand, mh_order, blocks, bwc):
     return pd.DataFrame(results)
 
 # ==========================================
-# CÁC HÀM XUẤT EXCEL (ĐẦY ĐỦ CỦA BẠN)
+# CÁC HÀM XUẤT EXCEL
 # ==========================================
 def styled_cell(ws, row, col, value='', bold=False, color='000000', bg=None, size=10, align='center', wrap=False, border=True, font_name='Arial'):
     c = ws.cell(row=row, column=col, value=value)
@@ -500,11 +514,13 @@ if uploaded_file is not None:
                 st.success("✅ Tính toán hoàn tất!")
                 n_clash = int((df_result.clash == 'CLASH').sum())
                 
+                # Hiển thị thống kê ngắn gọn
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Tổng số lệnh phân bổ", f"{len(df_result)} dòng")
                 col2.metric("Số lượng Time Slots", f"{len(mh_order)}")
                 col3.metric("Số lượng Clash (Trùng lặp)", f"{n_clash} lỗi", delta_color="inverse")
                 
+                # Nút tải file
                 st.download_button(
                     label="📥 TẢI FILE EXCEL KẾT QUẢ ĐẦY ĐỦ",
                     data=excel_buffer,
@@ -514,5 +530,4 @@ if uploaded_file is not None:
                 )
 
             except Exception as e:
-
                 st.error(f"❌ Có lỗi xảy ra trong quá trình đọc file.\n\nChi tiết lỗi: {e}")
