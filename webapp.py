@@ -10,9 +10,9 @@ from phanbo import run_optimization
 # ==========================================
 # CẤU HÌNH GIAO DIỆN WEB
 # ==========================================
-st.set_page_config(page_title="Hệ thống Tính toán Tối ưu", page_icon="🚢", layout="wide")
+st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="wide")
 
-st.title("🚢 HỆ THỐNG XỬ LÝ DỮ LIỆU TỰ ĐỘNG")
+st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU TỰ ĐỘNG")
 st.markdown("Tải file dữ liệu đầu vào (Excel) để hệ thống chạy thuật toán và trả về kết quả.")
 
 # ==========================================
@@ -46,9 +46,9 @@ if uploaded_file is not None:
                 # Nút tải file kết quả
                 # ==========================================================
                 st.download_button(
-                    label="📥 TẢI FILE EXCEL KẾT QUẢ XUỐNG MÁY",
+                    label="📥 TẢI FILE KẾT QUẢ ",
                     data=excel_buffer,
-                    file_name="KET_QUA_PHAN_BO.xlsx",
+                    file_name="PHAN_BO.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary"
                 )
@@ -58,3 +58,4 @@ if uploaded_file is not None:
                 # MODIFIED: Bắt lỗi và hiển thị chi tiết
                 # ==========================================================
                 st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nChi tiết lỗi: {e}")
+
