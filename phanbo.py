@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pulp
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from io import BytesIO
 
@@ -56,20 +56,23 @@ def _style(ws, coord, value=None, bold=False, font_color="FF000000",
         cell.border = _thin_border()
     return cell
 
+# ============================================================
+# HÀM CHÍNH: run_optimization
+# ============================================================
 def run_optimization(input_file):
-    # Đọc file input
+    """
+    input_file: đường dẫn hoặc file-like object (BytesIO) chứa file Excel.
+    Trả về: (excel_bytes, total_rows, objective_value)
+    """
     xls = pd.ExcelFile(input_file)
 
-    # ============================================================
-    # Sheet 1: MOVEHOUR-WEIGHTCLASS
-    # ============================================================
+    # --- Sheet 1: MOVEHOUR-WEIGHTCLASS ---
     df1 = pd.read_excel(xls, sheet_name='MOVEHOUR-WEIGHTCLASS', header=None)
 
-    # Phát hiện định dạng (có cột ST/POD không)
+    # Kiểm tra định dạng (có ST/POD hay không)
     has_st_pod = (str(df1.iloc[1, 2]).strip().upper() == 'ST')
     data_col_start = 4 if has_st_pod else 2
 
-    # Map STS+BAY từ dòng 0 và 1
     sts_bay_map = {}
     for col in range(data_col_start, df1.shape[1]):
         sts = df1.iloc[0, col]
@@ -87,7 +90,7 @@ def run_optimization(input_file):
         else:
             current_hour = hour
 
-        # --- Xử lý cột WEIGHT CLASS an toàn ---
+        # Xử lý cột WEIGHT CLASS an toàn
         weight_raw = row[1]
         if pd.isna(weight_raw):
             continue
@@ -96,11 +99,10 @@ def run_optimization(input_file):
             continue
         weight = int(weight_val)
 
-        # ST, POD (nếu có)
-        st_val  = str(row[2]).strip() if has_st_pod and pd.notna(row[2]) else ''
+        # Đọc ST, POD nếu có
+        st_val = str(row[2]).strip() if has_st_pod and pd.notna(row[2]) else ''
         pod_val = str(row[3]).strip() if has_st_pod and pd.notna(row[3]) else ''
 
-        # Duyệt các cột dữ liệu STS×BAY
         for col in range(data_col_start, df1.shape[1]):
             qty_raw = row[col]
             if pd.notna(qty_raw) and qty_raw != '':
@@ -125,9 +127,7 @@ def run_optimization(input_file):
     for (h, s, b) in job_keys:
         jobs_by_hour.setdefault(h, []).append((s, b))
 
-    # ============================================================
-    # Sheet 2: BLOCK-WEIGHT CLASS
-    # ============================================================
+    # --- Sheet 2: BLOCK-WEIGHT CLASS ---
     df2 = pd.read_excel(xls, sheet_name='BLOCK-WEIGHT CLASS', header=0)
     col_names = [str(c).strip() for c in df2.columns]
 
@@ -140,9 +140,10 @@ def run_optimization(input_file):
         block = str(row.iloc[0]).strip()
         if block in ('nan', 'GRAND TOTAL', '') or not block:
             continue
-        st_v  = str(row.iloc[1]).strip() if has_st_pod_supply else ''
+        st_v = str(row.iloc[1]).strip() if has_st_pod_supply else ''
         pod_v = str(row.iloc[2]).strip() if has_st_pod_supply else ''
         skey = (block, st_v, pod_v)
+
         wc_dict = {}
         for wi, w in enumerate([1, 2, 3, 4, 5]):
             col_idx = wc_col_start + wi
@@ -162,9 +163,7 @@ def run_optimization(input_file):
     print(f"Supply format: {'BLOCK+ST+POD' if has_st_pod_supply else 'BLOCK only (legacy)'}")
     print(f"Supply keys: {len(supply_keys)} (block×ST×POD combinations)")
 
-    # ============================================================
-    # Sheet 3: DATA (container layout)
-    # ============================================================
+    # --- Sheet 3: DATA (container layout) ---
     container_data_available = False
     try:
         df_containers = pd.read_excel(xls, sheet_name='DATA', header=0)
@@ -172,7 +171,8 @@ def run_optimization(input_file):
 
         def find_col(candidates):
             for c in candidates:
-                if c in cols: return c
+                if c in cols:
+                    return c
             return None
 
         wc_src = find_col(['YC', 'Unnamed: 1'])
@@ -188,12 +188,14 @@ def run_optimization(input_file):
                 subset=[wc_src, yp_src, 'YB', 'YR', 'YT']
             ).copy()
 
-            # Chuyển đổi REAL_WC an toàn
             df_containers['REAL_WC'] = pd.to_numeric(df_containers[wc_src], errors='coerce').fillna(0).astype(int)
             df_containers['YARD_POS'] = df_containers[yp_src].astype(str).str.strip()
-            df_containers['REAL_CONT_ID'] = (df_containers[id_src].fillna('').astype(str).str.strip() if id_src else '')
-            df_containers['CONT_ST'] = (df_containers[st_src].fillna('').astype(str).str.strip() if st_src else '')
-            df_containers['CONT_POD'] = (df_containers[pod_src].fillna('').astype(str).str.strip() if pod_src else '')
+            df_containers['REAL_CONT_ID'] = (df_containers[id_src].fillna('').astype(str).str.strip()
+                                             if id_src else '')
+            df_containers['CONT_ST'] = (df_containers[st_src].fillna('').astype(str).str.strip()
+                                        if st_src else '')
+            df_containers['CONT_POD'] = (df_containers[pod_src].fillna('').astype(str).str.strip()
+                                         if pod_src else '')
             df_containers['YARD'] = df_containers['YARD'].astype(str).str.strip()
             df_containers['YB'] = df_containers['YB'].astype(float).astype(int)
             df_containers['YR'] = df_containers['YR'].astype(float).astype(int)
@@ -209,10 +211,8 @@ def run_optimization(input_file):
     except Exception as e:
         print(f"No DATA sheet found – stacking rules skipped. ({e})")
 
-    # ============================================================
-    # Build container stacking structures (nếu có DATA)
-    # ============================================================
-    yb_wc_supply   = {}
+    # --- Build container stacking structures ---
+    yb_wc_supply = {}
     stack_ordering = {}
     blocking_pairs = []
 
@@ -242,9 +242,7 @@ def run_optimization(input_file):
                         wcs_above.append((wc, tier))
         print(f"Stacking structures built: {len(blocking_pairs)} cross-WC blocking pairs found.")
 
-    # ============================================================
-    # Kiểm tra cân bằng cung - cầu
-    # ============================================================
+    # --- Check demand vs supply ---
     total_demand = {}
     for job in job_keys:
         for dkey, qty in demands[job].items():
@@ -275,16 +273,16 @@ def run_optimization(input_file):
         raise ValueError("Tổng cầu và cung không khớp cho một số tổ hợp (WC, ST, POD).")
     print("Demand/supply balanced OK.")
 
-    # ============================================================
-    # Xây dựng mô hình tối ưu
-    # ============================================================
+    # --- Build optimization model ---
     prob = pulp.LpProblem("Minimize_Clashes_ST_POD", pulp.LpMinimize)
 
+    # y[h,s,bay,b]
     y_vars = {}
     for (h, s, bay) in job_keys:
         for b in blocks:
             y_vars[(h, s, bay, b)] = pulp.LpVariable(f"y_{h}_{s}_{bay}_{b}", cat='Binary')
 
+    # x[h,s,bay,b,(w,st,pod)]
     x_vars = {}
     for (h, s, bay) in job_keys:
         for dkey in demands[(h, s, bay)]:
@@ -296,14 +294,14 @@ def run_optimization(input_file):
                 vname = f"x_{h}_{s}_{bay}_{b}_{w}_{st_v}_{pod_v}"
                 x_vars[(h, s, bay, b, dkey)] = pulp.LpVariable(vname, lowBound=0, cat='Integer')
 
+    # Clash counting
     u_vars = {}
     e_vars = {}
     for h in jobs_by_hour:
         for b in blocks:
             u_vars[(h, b)] = pulp.LpVariable(f"u_{h}_{b}", lowBound=0, cat='Integer')
             e_vars[(h, b)] = pulp.LpVariable(f"e_{h}_{b}", lowBound=0, cat='Integer')
-            prob += u_vars[(h, b)] == pulp.lpSum(
-                y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h])
+            prob += u_vars[(h, b)] == pulp.lpSum(y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h])
             prob += e_vars[(h, b)] >= u_vars[(h, b)] - 1
 
     prob += pulp.lpSum(e_vars.values())
@@ -311,11 +309,12 @@ def run_optimization(input_file):
     # Demand constraints
     for (h, s, bay) in job_keys:
         for dkey, d in demands[(h, s, bay)].items():
+            w, st_v, pod_v = dkey
             x_sum = pulp.lpSum(
                 x_vars[(h, s, bay, b, dkey)]
                 for skey in supply_keys
                 for b in [skey[0]]
-                if skey[1] == dkey[1] and skey[2] == dkey[2]
+                if skey[1] == st_v and skey[2] == pod_v
                 and (h, s, bay, b, dkey) in x_vars
             )
             prob += x_sum == d
@@ -354,9 +353,7 @@ def run_optimization(input_file):
     elif status not in (1,):
         print("No optimal solution found within time limit – using best solution found.")
 
-    # ============================================================
-    # Kết xuất kết quả
-    # ============================================================
+    # --- Extract results ---
     result_rows = []
     for (h, s, bay, b) in y_vars:
         if pulp.value(y_vars[(h, s, bay, b)]) is not None and \
@@ -378,9 +375,7 @@ def run_optimization(input_file):
     df_result = pd.DataFrame(result_rows)
     df_result.sort_values(['MOVE HOUR', 'STS', 'BAY', 'ASSIGNED BLOCK'], inplace=True)
 
-    # ============================================================
-    # Map container chi tiết (greedy)
-    # ============================================================
+    # --- Map individual containers (greedy) ---
     df_result_detail = []
 
     if container_data_available:
@@ -415,9 +410,12 @@ def run_optimization(input_file):
             containers = pool[block]
             remaining = qty
             def matches(c):
-                if c['wc'] != wc: return False
-                if st_match and c.get('st','') != st_match: return False
-                if pod_match and c.get('pod','') != pod_match: return False
+                if c['wc'] != wc:
+                    return False
+                if st_match and c.get('st', '') != st_match:
+                    return False
+                if pod_match and c.get('pod', '') != pod_match:
+                    return False
                 return True
             while remaining > 0:
                 cands = [c for c in containers
@@ -461,7 +459,6 @@ def run_optimization(input_file):
         for h in all_hours_sorted:
             h_rank_val = hour_rank[h]
             hour_asgns = df_result_sorted[df_result_sorted['MOVE HOUR'] == h]
-
             for _, asg in hour_asgns.iterrows():
                 s, bay_job, b = asg['STS'], asg['BAY'], asg['ASSIGNED BLOCK']
                 w = int(asg['WEIGHT CLASS'])
@@ -502,7 +499,6 @@ def run_optimization(input_file):
             print("  All containers assigned with no re-handling required.")
 
         df_result_detail = pd.DataFrame(df_result_detail)
-
     else:
         df_result_detail = df_result.copy()
         df_result_detail.insert(1, 'CONTAINER ID', '')
@@ -518,9 +514,7 @@ def run_optimization(input_file):
         inplace=True
     )
 
-    # ============================================================
-    # Chuẩn bị dữ liệu cho các sheet MATRIX và DETAIL
-    # ============================================================
+    # --- Prepare MATRIX and DETAIL data ---
     df_matrix_base = df_result.groupby(
         ['MOVE HOUR', 'STS', 'BAY', 'ASSIGNED BLOCK'], as_index=False
     )['QUANTITIES'].sum()
@@ -558,7 +552,6 @@ def run_optimization(input_file):
         if key in matrix_data.get(row['MOVE HOUR'], {}):
             matrix_data[row['MOVE HOUR']][key] = row['QUANTITIES']
 
-    # DETAIL groups
     detail_groups_by_sts = {}
     for sts in sts_list:
         detail_groups_by_sts[sts] = []
@@ -595,9 +588,7 @@ def run_optimization(input_file):
         max_w = max(2 + len(g['blocks']) + 1 for g in detail_groups_by_sts[sts])
         sts_table_widths[sts] = max_w
 
-    # ============================================================
-    # Tạo file Excel với openpyxl
-    # ============================================================
+    # --- Write Excel file with openpyxl ---
     import openpyxl
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -649,9 +640,9 @@ def run_optimization(input_file):
             cell.fill = _fill(C_LIGHT_BLUE)
         else:
             cell.fill = _fill(C_DARK_BLUE)
-        cell.font      = _font(bold=True, color=C_WHITE)
+        cell.font = _font(bold=True, color=C_WHITE)
         cell.alignment = _align(wrap=True)
-        cell.border    = _thin_border()
+        cell.border = _thin_border()
 
     df_rd = df_result_detail.reset_index(drop=True)
     n_rows = len(df_rd)
@@ -696,18 +687,18 @@ def run_optimization(input_file):
                 if val == '' or (isinstance(val, float) and str(val) == 'nan'):
                     val = None
             cell = ws_result.cell(row=r_idx, column=c_idx, value=val)
-            cell.font      = _font(color='FF000000')
-            cell.fill      = _fill(group_shade)
+            cell.font = _font(color='FF000000')
+            cell.fill = _fill(group_shade)
             cell.alignment = _align(wrap=(cn == 'CONT LIST'))
-            cell.border    = _thin_border()
+            cell.border = _thin_border()
 
     if container_data_available:
         for (mh, bay), r_start, r_end, list_text in merge_groups:
             cell = ws_result.cell(row=r_start, column=cont_list_col_idx, value=list_text or None)
-            cell.font      = _font(color='FF000000', size=9)
-            cell.fill      = _fill(C_PALE_BLUE)
+            cell.font = _font(color='FF000000', size=9)
+            cell.fill = _fill(C_PALE_BLUE)
             cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
-            cell.border    = _thin_border()
+            cell.border = _thin_border()
             if r_end > r_start:
                 ws_result.merge_cells(
                     start_row=r_start, start_column=cont_list_col_idx,
@@ -1035,7 +1026,7 @@ def run_optimization(input_file):
     for c in range(1, total_detail_cols + 2):
         ws_detail.column_dimensions[get_column_letter(c)].width = 8
 
-    # Lưu vào buffer và trả về
+    # Save to BytesIO and return
     output_buffer = BytesIO()
     wb.save(output_buffer)
     output_buffer.seek(0)
@@ -1045,6 +1036,9 @@ def run_optimization(input_file):
 
     return output_buffer, total_rows, objective_value
 
+# ============================================================
+# Chạy thử (nếu file được thực thi trực tiếp)
+# ============================================================
 if __name__ == "__main__":
     try:
         buf, rows, obj = run_optimization('TEST2.xlsx')
