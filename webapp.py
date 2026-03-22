@@ -37,9 +37,10 @@ if uploaded_file is not None:
                 # ==========================================================
                 # Hiển thị thống kê ngắn gọn
                 # ==========================================================
-                col1 = st.columns(2)
+                col1, col2 = st.columns(2)
+                col1.metric("Tổng số dòng phân bổ", f"{total_rows} dòng")
                 # objective_value là tổng số clash (càng nhỏ càng tốt), nếu bằng 0 là không có clash
-                col1.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
+                col2.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
                 
                 # ==========================================================
                 # Nút tải file kết quả
@@ -57,4 +58,3 @@ if uploaded_file is not None:
                 # MODIFIED: Bắt lỗi và hiển thị chi tiết
                 # ==========================================================
                 st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nChi tiết lỗi: {e}")
-
