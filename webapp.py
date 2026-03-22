@@ -10,7 +10,7 @@ from ALLOCATION import run_optimization
 # ==========================================
 # CẤU HÌNH GIAO DIỆN WEB
 # ==========================================
-st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="wide")
+st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="centered")
 
 st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU TỰ ĐỘNG")
 st.markdown("Tải file dữ liệu đầu vào (Excel) để hệ thống chạy thuật toán và trả về kết quả.")
