@@ -3,9 +3,9 @@ import io
 import pandas as pd
 
 # ============================================================
-# ADDED: Import hàm xử lý chính từ file phanbo.py
+# ADDED: Import hàm xử lý chính từ file ALLOCATION.py
 # ============================================================
-from phanbo import run_optimization
+from ALLOCATION import run_optimization
 
 # ==========================================
 # CẤU HÌNH GIAO DIỆN WEB
