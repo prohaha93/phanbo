@@ -12,7 +12,7 @@ from ALLOCATION import run_optimization
 # ==========================================
 st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="centered")
 
-st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU TỰ ĐỘNG")
+st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU")
 st.markdown("Tải file dữ liệu đầu vào (Excel) để hệ thống chạy thuật toán và trả về kết quả.")
 
 # ==========================================
@@ -37,10 +37,9 @@ if uploaded_file is not None:
                 # ==========================================================
                 # Hiển thị thống kê ngắn gọn
                 # ==========================================================
-                col1, col2 = st.columns(2)
-                col1.metric("Tổng số dòng phân bổ", f"{total_rows} dòng")
+                col1 = st.columns(2)
                 # objective_value là tổng số clash (càng nhỏ càng tốt), nếu bằng 0 là không có clash
-                col2.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
+                col1.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
                 
                 # ==========================================================
                 # Nút tải file kết quả
