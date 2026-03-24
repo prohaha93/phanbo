@@ -374,9 +374,47 @@ def run_optimization(file_input):
             prob += e_vars[(h, b)] >= u_vars[(h, b)] - 1
 
     # ============================================================
-    # 3a. Objective: minimise clashes
+    # 3a. Objective: minimise clashes + movement penalties
     # ============================================================
-    prob += pulp.lpSum(e_vars.values())
+    # Weight tuning:
+    #   CLASH_W      : clash cost (highest priority)
+    #   SINGLE_W     : penalty when a vessel bay uses only 1 block
+    #                  → encourage ≥2 blocks per bay (spread yard movements)
+    #   SPREAD_W     : penalty per distinct vessel-bay a block serves
+    #                  → encourage each block to focus on fewer bays
+    CLASH_W  = 1.0
+    SINGLE_W = 0.3    # moderate: prefer multi-block per bay
+    SPREAD_W = 0.05   # small: prefer concentrated block movement
+
+    # single_block[h,s,bay] = 1 if only 1 block serves this job
+    # Constraint: single_block >= 2 - sum_b(y[h,s,bay,b])
+    # When sum_b y = 1 → single_block >= 1 (penalised)
+    # When sum_b y >= 2 → constraint trivially satisfied → single_block = 0
+    single_block = {}
+    for (h, s, bay) in job_keys:
+        single_block[(h, s, bay)] = pulp.LpVariable(
+            f"sb_{h}_{s}_{bay}", lowBound=0, upBound=1, cat='Continuous')
+        prob += single_block[(h, s, bay)] >= (
+            2 - pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks)
+        )
+
+    # block_bay[b, bay] = 1 if block b serves ANY job at vessel bay 'bay'
+    # Constraint: block_bay[b,bay] >= y[h,s,bay,b]  for each h,s
+    all_bays = sorted(set(bay for (_, _, bay) in job_keys))
+    block_bay = {}
+    for b in blocks:
+        for bay in all_bays:
+            var = pulp.LpVariable(f"bb_{b}_{bay}", cat='Binary')
+            block_bay[(b, bay)] = var
+            for (h, s, bj) in job_keys:
+                if bj == bay:
+                    prob += var >= y_vars[(h, s, bay, b)]
+
+    clash_term    = pulp.lpSum(e_vars.values())
+    single_term   = pulp.lpSum(single_block.values())
+    spread_term   = pulp.lpSum(block_bay.values())
+
+    prob += CLASH_W * clash_term + SINGLE_W * single_term + SPREAD_W * spread_term
 
     # ============================================================
     # 3b. Core constraints
@@ -485,12 +523,18 @@ def run_optimization(file_input):
             pool.setdefault(blk, []).append({
                 'yb': int(row['YB']), 'yr': int(row['YR']), 'yt': int(row['YT']),
                 'wc': int(row['REAL_WC']),
-                'yard_pos':     row['YARD_POS'],       # e.g. A01.14.01.1  (col C)
-                'real_cont_id': row['REAL_CONT_ID'],   # real container ID  (col D)
-                'st':           row['CONT_ST'],         # size type          (col E)
-                'pod':          row['CONT_POD'],        # port of discharge  (col F)
+                'yard_pos':     row['YARD_POS'],
+                'real_cont_id': row['REAL_CONT_ID'],
+                'st':           row['CONT_ST'],
+                'pod':          row['CONT_POD'],
                 'picked': False, 'pick_h': None
             })
+
+        # ── Sticky YB tracker ────────────────────────────────────────────────
+        # opened_ybs[(block, yb)] = True  khi đã bắt đầu lấy từ YB này
+        # YB đã được "mở" (partially picked) sẽ được ưu tiên cao nhất,
+        # để dứt điểm lấy hết trước khi chuyển sang YB mới trong cùng block.
+        opened_ybs = set()   # (block, yb) pairs that have been started
 
         def accessible_at(cont, containers, h_rank_val):
             for c in containers:
@@ -506,7 +550,9 @@ def run_optimization(file_input):
         def pick_n(block, wc, st_match, pod_match, qty, h, s_job, bay_job, h_rank_val, result_list):
             """
             Pick qty containers of (wc, st_match) from block, with priority:
-              P1. YB with most accessible matching containers first.
+              P0. STICKY YB: YB đã được mở (partially picked) → ưu tiên tuyệt đối
+                  để dứt điểm 1 YB trước khi sang YB mới (tránh di chuyển rải rác).
+              P1. YB mới: chọn YB có nhiều container nhất (concentrate per YB).
               P2. Within YB: lowest YR first (row 1 → 7).
               P3. Within row: highest YT first (top → bottom, no re-handling).
             Incremental: re-evaluate after each pick.
@@ -524,20 +570,27 @@ def run_optimization(file_input):
                          and accessible_at(c, containers, h_rank_val)]
                 if not cands:
                     break
-                # P1: YB with most accessible WC-w containers
+                # Count accessible matching containers per YB
                 yb_cnt = {}
                 for c in cands:
                     yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
-                # Sort: P1 -> P2 -> P3
+                # Sort key:
+                #   P0: sticky=0 (already opened) beats sticky=1 (fresh YB)
+                #   P1: most containers in YB (descending)
+                #   P2: lower YB id (tie-break, consistent ordering)
+                #   P3: lower YR (row 1 → 7)
+                #   P4: highest tier first
                 cands.sort(key=lambda c: (
+                    0 if (block, c['yb']) in opened_ybs else 1,  # P0: sticky first
                     -yb_cnt[c['yb']],  # P1: most-loaded YB first
-                    c['yb'],           # tie-break: consistent YB id
-                    c['yr'],           # P2: row 1 → 7 (ascending)
-                    -c['yt']           # P3: highest tier first (top → bottom)
+                    c['yb'],           # P2: tie-break YB id
+                    c['yr'],           # P3: row 1 → 7
+                    -c['yt']           # P4: highest tier first
                 ))
                 best = cands[0]
                 best['picked'] = True
                 best['pick_h'] = h
+                opened_ybs.add((block, best['yb']))   # mark YB as opened
                 result_list.append({
                     'MOVE HOUR':      h,
                     'CONTAINER ID':   best['real_cont_id'],
