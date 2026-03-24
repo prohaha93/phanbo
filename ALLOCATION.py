@@ -383,7 +383,7 @@ def run_optimization(file_input):
     #   SPREAD_W     : penalty per distinct vessel-bay a block serves
     #                  → encourage each block to focus on fewer bays
     CLASH_W  = 1.0
-    SINGLE_W = 0.3    # moderate: prefer multi-block per bay
+    SINGLE_W = 0.8    # strong: strongly prefer multi-block per bay (spread yard workload)
     SPREAD_W = 0.05   # small: prefer concentrated block movement
 
     # single_block[h,s,bay] = 1 if only 1 block serves this job
@@ -536,6 +536,13 @@ def run_optimization(file_input):
         # để dứt điểm lấy hết trước khi chuyển sang YB mới trong cùng block.
         opened_ybs = set()   # (block, yb) pairs that have been started
 
+        # ── Committed YB tracker ─────────────────────────────────────────────
+        # current_yb_for[(block, wc)] = yb  — YB đang được "dứt điểm" cho (block, WC) này.
+        # Chỉ chuyển sang YB khác khi YB hiện tại KHÔNG CÒN container WC đó có thể lấy.
+        # Đảm bảo cùng 1 WC trong 1 block được lấy tập trung, dù nhiều vessel bay
+        # khác nhau cùng kéo từ block đó ở các giờ khác nhau.
+        current_yb_for = {}  # (block, wc) → currently committed yard-bay id
+
         def accessible_at(cont, containers, h_rank_val):
             for c in containers:
                 if c is cont:
@@ -550,11 +557,14 @@ def run_optimization(file_input):
         def pick_n(block, wc, st_match, pod_match, qty, h, s_job, bay_job, h_rank_val, result_list):
             """
             Pick qty containers of (wc, st_match) from block, with priority:
-              P0. STICKY YB: YB đã được mở (partially picked) → ưu tiên tuyệt đối
-                  để dứt điểm 1 YB trước khi sang YB mới (tránh di chuyển rải rác).
-              P1. YB mới: chọn YB có nhiều container nhất (concentrate per YB).
-              P2. Within YB: lowest YR first (row 1 → 7).
-              P3. Within row: highest YT first (top → bottom, no re-handling).
+              P0. COMMITTED YB: (block, wc) đang được "dứt điểm" tại 1 YB cụ thể →
+                  tiếp tục lấy đúng YB đó cho đến khi hết, bất kể vessel bay nào gọi.
+                  Chỉ giải phóng commitment khi YB đó không còn container WC này nữa.
+                  → Tránh tình trạng block A03 rải rác WC1 trên 20 YB khác nhau.
+              P1. STICKY YB: YB đã được mở ở bất kỳ WC nào → ưu tiên tiếp theo
+                  để giảm số YB bị "nửa chừng" trên block.
+              P2. YB mới: chọn YB có nhiều container WC đó nhất (concentrate pick).
+              P3. Tie-break: lower YB id → lower YR → highest tier first (top-down).
             Incremental: re-evaluate after each pick.
             """
             containers = pool[block]
@@ -570,32 +580,47 @@ def run_optimization(file_input):
                          and accessible_at(c, containers, h_rank_val)]
                 if not cands:
                     break
+
                 # Count accessible matching containers per YB
                 yb_cnt = {}
                 for c in cands:
                     yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
+
+                # ── P0: resolve committed YB ────────────────────────────────
+                # If current committed YB has no more accessible candidates for
+                # this (block, wc), release the commitment and pick the best next YB.
+                committed_yb = current_yb_for.get((block, wc))
+                if committed_yb is not None and committed_yb not in yb_cnt:
+                    # Committed YB exhausted for this WC → release
+                    committed_yb = None
+                    current_yb_for.pop((block, wc), None)
+
                 # Sort key:
-                #   P0: sticky=0 (already opened) beats sticky=1 (fresh YB)
-                #   P1: most containers in YB (descending)
-                #   P2: lower YB id (tie-break, consistent ordering)
-                #   P3: lower YR (row 1 → 7)
-                #   P4: highest tier first
-                cands.sort(key=lambda c: (
-                    0 if (block, c['yb']) in opened_ybs else 1,  # P0: sticky first
-                    -yb_cnt[c['yb']],  # P1: most-loaded YB first
-                    c['yb'],           # P2: tie-break YB id
-                    c['yr'],           # P3: row 1 → 7
-                    -c['yt']           # P4: highest tier first
-                ))
+                #   P0: committed YB → score 0 (absolute top priority)
+                #   P1: opened/sticky YB → score 1
+                #   P2: fresh YB → score 2
+                #   Then: most containers in chosen YB, lower YB id, lower YR, top tier first
+                def _sort_key(c):
+                    if committed_yb is not None and c['yb'] == committed_yb:
+                        p0 = 0   # committed: must drain this first
+                    elif (block, c['yb']) in opened_ybs:
+                        p0 = 1   # already opened: prefer before fresh
+                    else:
+                        p0 = 2   # fresh YB: last resort
+                    return (p0, -yb_cnt[c['yb']], c['yb'], c['yr'], -c['yt'])
+
+                cands.sort(key=_sort_key)
                 best = cands[0]
                 best['picked'] = True
                 best['pick_h'] = h
-                opened_ybs.add((block, best['yb']))   # mark YB as opened
+                opened_ybs.add((block, best['yb']))        # mark as opened
+                current_yb_for[(block, wc)] = best['yb']   # commit / keep commitment
+
                 result_list.append({
                     'MOVE HOUR':      h,
                     'CONTAINER ID':   best['real_cont_id'],
-                    'ST':             best.get('st', st_match),   # actual ST from container
-                    'POD':            best.get('pod', pod_match),  # actual POD from container
+                    'ST':             best.get('st', st_match),
+                    'POD':            best.get('pod', pod_match),
                     'STS': s_job,     'BAY': bay_job,
                     'ASSIGNED BLOCK': block,
                     'WEIGHT CLASS':   wc,
