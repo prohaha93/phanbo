@@ -30,7 +30,8 @@ if uploaded_file is not None:
                 # MODIFIED: Gọi hàm run_optimization với file upload (đã là BytesIO)
                 # Hàm trả về buffer (chứa file Excel kết quả), số dòng, giá trị mục tiêu
                 # ==========================================================
-                excel_buffer, total_rows, objective_value = run_optimization(uploaded_file)
+                excel_buffer, total_rows, total_clashes, exec_time = run_optimization(uploaded_file)
+                st.write(f"Thời gian chạy: {exec_time:.2f} giây")
                 
                 st.success("✅ Tính toán hoàn tất!")
                 
