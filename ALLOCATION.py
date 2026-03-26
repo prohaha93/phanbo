@@ -401,8 +401,8 @@ def run_optimization(file_input):
             2 - pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks)
         )
 
-    # block_bay[b, bay] = 1 if block b serves ANY job at vessel bay 'bay'
-    # Constraint: block_bay[b,bay] >= y[h,s,bay,b]  for each h,s
+    # block_bay[b, bay] = 1 if block b serves ANY hour of vessel bay 'bay'
+    # Dung cho spread_term (penalty mem) - KHONG dung de cap cung toan cuc
     all_bays = sorted(set(bay for (_, _, bay) in job_keys))
     block_bay = {}
     for b in blocks:
@@ -413,28 +413,28 @@ def run_optimization(file_input):
                 if bj == bay:
                     prob += var >= y_vars[(h, s, bay, b)]
 
-    # ── Hard constraint: số block tối đa mỗi vessel bay ─────────────────────
-    # Giới hạn cứng: mỗi vessel bay chỉ được lấy hàng từ tối đa MAX_BLOCKS_PER_BAY block
-    # (tính trên toàn bộ các giờ). Mục tiêu: tránh tình trạng 1 bay tập hợp quá nhiều
-    # block rải rác (ví dụ bay 62 lấy từ 6-7 block), tập trung vào 2-3 block hợp lý.
-    # Nếu solver báo infeasible → tăng MAX_BLOCKS_PER_BAY lên 4.
-    MAX_BLOCKS_PER_BAY = 3
-    for bay in all_bays:
-        prob += (
-            pulp.lpSum(block_bay[(b, bay)] for b in blocks) <= MAX_BLOCKS_PER_BAY,
-            f"max_blocks_bay_{bay}"
-        )
-    print(f"Block-per-bay hard cap: {MAX_BLOCKS_PER_BAY} blocks/vessel bay")
+    # Hard constraint: cap so block MOI (hour, bay) - khong phai global per bay
+    # Fix dung: bay 62 co the dung block A gio 1 va block B gio 2 (global=2 blocks, OK).
+    # Nhung trong 1 gio, 1 bay chi duoc lay tu toi da MAX_BLOCKS_PER_HOUR_BAY blocks.
+    # MAX_BLOCKS_PER_HOUR_BAY = 3 : moi (hour, bay) dung toi da 3 block
+    # MIN_BLOCKS_THRESHOLD = 4 : chi enforce minimum 2 blocks khi demand >= 4 cont
+    MAX_BLOCKS_PER_HOUR_BAY = 3
+    MIN_BLOCKS_THRESHOLD    = 4
 
-    # over_share[h,s,bay,b]: phần vượt quá 1/MAX_BLOCKS khi 1 block chiếm quá nhiều
-    # Trong giới hạn MAX_BLOCKS_PER_BAY block, mục tiêu phân bổ đều giữa các block.
-    # Threshold = 1/MAX_BLOCKS_PER_BAY (nếu 3 block → mỗi block lý tưởng ~33%)
+    for (h, s, bay) in job_keys:
+        n_blocks_used = pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks)
+        prob += (n_blocks_used <= MAX_BLOCKS_PER_HOUR_BAY,
+                 f"max_blk_{h}_{s}_{bay}")
+
+    print(f"Block-per-(hour,bay) hard cap: {MAX_BLOCKS_PER_HOUR_BAY}")
+
+    # over_share: penalty khi 1 block chiem hon 50% demand cua (hour, bay)
     over_share = {}
     for (h, s, bay) in job_keys:
         total_d = sum(demands[(h, s, bay)].values())
-        if total_d <= 1:
+        if total_d < MIN_BLOCKS_THRESHOLD:
             continue
-        threshold = total_d / MAX_BLOCKS_PER_BAY   # phần đều nhau nếu đủ block
+        threshold = total_d * 0.5
         for b in blocks:
             relevant_x = [x_vars[(h, s, bay, b, dk)]
                           for dk in demands[(h, s, bay)]
@@ -445,14 +445,14 @@ def run_optimization(file_input):
             over_share[(h, s, bay, b)] = v
             prob += v >= pulp.lpSum(relevant_x) - threshold
 
-    clash_term    = pulp.lpSum(e_vars.values())
-    single_term   = pulp.lpSum(single_block.values())
-    spread_term   = pulp.lpSum(block_bay.values())
-    balance_term  = pulp.lpSum(over_share.values()) if over_share else 0
+    clash_term   = pulp.lpSum(e_vars.values())
+    single_term  = pulp.lpSum(single_block.values())
+    spread_term  = pulp.lpSum(block_bay.values())
+    balance_term = pulp.lpSum(over_share.values()) if over_share else 0
 
-    prob += (CLASH_W  * clash_term
-           + SINGLE_W * single_term
-           + SPREAD_W * spread_term
+    prob += (CLASH_W   * clash_term
+           + SINGLE_W  * single_term
+           + SPREAD_W  * spread_term
            + BALANCE_W * balance_term)
 
     # ============================================================
@@ -496,28 +496,26 @@ def run_optimization(file_input):
 
     # NOTE: YB concentration and physical tier-ordering enforced by greedy post-processor.
 
-    # 3d. Solve with auto-fallback if block-per-bay cap is too tight
+    # 3d. Solve
     # ============================================================
+    # Auto-fallback: neu infeasible do cap per-(hour,bay) qua chat,
+    # noi long dan tu 3 -> 4 -> khong gioi han.
     solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300)
-
-    effective_cap = MAX_BLOCKS_PER_BAY
+    effective_cap = MAX_BLOCKS_PER_HOUR_BAY
     prob.solve(solver)
     status = prob.status
     print(f"Status (cap={effective_cap}): {pulp.LpStatus[status]}")
 
-    # If infeasible, progressively relax the block-per-bay cap
-    for fallback_cap in [MAX_BLOCKS_PER_BAY + 1, MAX_BLOCKS_PER_BAY + 2, len(blocks)]:
+    for fallback_cap in [MAX_BLOCKS_PER_HOUR_BAY + 1, len(blocks)]:
         if status != pulp.constants.LpStatusInfeasible:
             break
-        print(f"  Infeasible at cap={effective_cap}, thu noi long len cap={fallback_cap}...")
-        for bay in all_bays:
-            cname = f"max_blocks_bay_{bay}"
+        print(f"  Infeasible at cap={effective_cap}, noi long len cap={fallback_cap}...")
+        for (h, s, bay) in job_keys:
+            cname = f"max_blk_{h}_{s}_{bay}"
             if cname in prob.constraints:
                 del prob.constraints[cname]
-            prob += (
-                pulp.lpSum(block_bay[(b, bay)] for b in blocks) <= fallback_cap,
-                cname
-            )
+            prob += (pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks) <= fallback_cap,
+                     cname)
         effective_cap = fallback_cap
         prob.solve(solver)
         status = prob.status
@@ -527,7 +525,7 @@ def run_optimization(file_input):
         raise RuntimeError("Model infeasible — kiem tra supply/demand va rang buoc.")
     elif status not in (1,):
         print("No optimal solution found within time limit – using best solution found.")
-    print(f"Effective block-per-bay cap used: {effective_cap}")
+    print(f"Effective block-per-(hour,bay) cap used: {effective_cap}")
 
     # ============================================================
     # 4. Extract result  +  map individual containers to each assignment
