@@ -1,7 +1,7 @@
 import streamlit as st
 import io
 import pandas as pd
-import time
+import time  # Thêm thư viện time để đo thời gian
 
 # ============================================================
 # ADDED: Import hàm xử lý chính từ file ALLOCATION.py
@@ -13,7 +13,17 @@ from ALLOCATION import run_optimization
 # ==========================================
 st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="centered")
 
-st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU")
+# CSS thu gọn, căn giữa
+st.markdown("""
+    <style>
+        .main > div {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🚢 HỆ THỐNG PHÂN BỔ TỐI ƯU TỰ ĐỘNG")
 st.markdown("Tải file dữ liệu đầu vào (Excel) để hệ thống chạy thuật toán và trả về kết quả.")
 
 # ==========================================
@@ -25,25 +35,29 @@ if uploaded_file is not None:
     st.info("Đã nhận file. Bấm nút bên dưới để tiến hành tính toán.")
     
     if st.button("🚀 CHẠY THUẬT TOÁN TỐI ƯU", use_container_width=True):
-        start_time = time.time()  # bắt đầu đo
+        # Ghi nhận thời gian bắt đầu
+        start_time = time.time()
+        
         with st.spinner('Hệ thống đang tính toán và xuất file... Vui lòng đợi!'):
             try:
                 # ==========================================================
-                # Gọi hàm run_optimization với file upload (đã là BytesIO)
-                # Hàm trả về buffer (chứa file Excel kết quả), số dòng, tổng clash, thời gian chạy
+                # MODIFIED: Gọi hàm run_optimization với file upload (đã là BytesIO)
+                # Hàm trả về buffer (chứa file Excel kết quả), số dòng, giá trị mục tiêu
                 # ==========================================================
-                excel_buffer, total_rows, total_clashes, exec_time = run_optimization(uploaded_file)
-                # exec_time là thời gian đã được tính bên trong hàm (có thể bỏ qua)
-                elapsed = time.time() - start_time  # tính lại để chính xác hơn
+                excel_buffer, total_rows, objective_value = run_optimization(uploaded_file)
                 
-                st.success(f"✅ Tính toán hoàn tất! Thời gian thực: {elapsed:.2f} giây")
+                # Tính thời gian đã chạy
+                elapsed_time = time.time() - start_time
+                
+                # Hiển thị thông báo hoàn thành kèm thời gian
+                st.success(f"✅ Tính toán hoàn tất! Thời gian xử lý: {elapsed_time:.2f} giây")
                 
                 # ==========================================================
                 # Hiển thị thống kê ngắn gọn
                 # ==========================================================
                 col1, col2 = st.columns(2)
                 col1.metric("Tổng số dòng phân bổ", f"{total_rows} dòng")
-                col2.metric("Số lượng Clash (u-1)", f"{total_clashes}", delta_color="inverse")
+                col2.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
                 
                 # ==========================================================
                 # Nút tải file kết quả
@@ -57,4 +71,6 @@ if uploaded_file is not None:
                 )
 
             except Exception as e:
-                st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nChi tiết lỗi: {e}")
+                # Trường hợp lỗi: vẫn tính thời gian (tuỳ chọn) và thông báo lỗi
+                elapsed_time = time.time() - start_time
+                st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nThời gian xử lý đến khi lỗi: {elapsed_time:.2f} giây\nChi tiết lỗi: {e}")
