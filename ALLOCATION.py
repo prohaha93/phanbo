@@ -74,8 +74,8 @@ def run_optimization(file_input):
         File Excel kết quả sẵn sàng để download.
     total_rows : int
         Tổng số dòng phân bổ trong sheet RESULT.
-    total_clashes : int
-        Số lượng clash thực tế (tổng e_vars).
+    objective_value : int
+        Số lượng clash (0 = không có clash).
     """
     # ============================================================
     # 1. Read and parse original data
@@ -373,12 +373,15 @@ def run_optimization(file_input):
     # ============================================================
     # 3a. Objective: minimise clashes + movement penalties
     # ============================================================
-    # Weight tuning (cải tiến: tăng mạnh trọng số để khuyến khích phân bổ đều)
-    CLASH_W  = 100.0    # ưu tiên cao nhất: giảm clash
-    SINGLE_W = 10.0     # phạt nặng nếu job chỉ dùng 1 block
-    SPREAD_W = 5.0      # phạt mỗi cặp (block, bay) → hạn chế một block phục vụ nhiều bay
-    BLOCK_BAY_WC_W = 2.0
-    BAY_SINGLE_W = 10.0   # phạt nặng nếu bay chỉ có 1 block
+    # Weight tuning:
+    #   CLASH_W      : clash cost (highest priority)
+    #   SINGLE_W     : penalty when a vessel bay uses only 1 block
+    #                  → encourage ≥2 blocks per bay (spread yard movements)
+    #   SPREAD_W     : penalty per distinct vessel-bay a block serves
+    #                  → encourage each block to focus on fewer bays
+    CLASH_W  = 1.0
+    SINGLE_W = 0.3    # moderate: prefer multi-block per bay
+    SPREAD_W = 0.05   # small: prefer concentrated block movement
 
     # single_block[h,s,bay] = 1 if only 1 block serves this job
     # Constraint: single_block >= 2 - sum_b(y[h,s,bay,b])
@@ -430,12 +433,90 @@ def run_optimization(file_input):
         total_blocks_bay = pulp.lpSum(block_bay[(b, bay)] for b in blocks)
         prob += var >= (2 - total_blocks_bay)
 
-    # ========== RÀNG BUỘC CỨNG: MỖI BAY PHẢI CÓ ÍT NHẤT 2 BLOCK ==========
-    min_blocks_per_bay = 2
+    # ========== CẢI TIẾN 3: Phạt khi một block chiếm quá nhiều container trong 1 vessel bay ==========
+    # Mục tiêu: với vessel bay có lượng lớn, đảm bảo phân bổ đều hơn giữa các block.
+    # Cách làm:
+    #   - Tính tổng demand cho mỗi vessel bay.
+    #   - Với mỗi cặp (block, bay), tính tổng container được giao.
+    #   - Đặt ngưỡng MAX_FRAC_PER_BLOCK: một block không nên đảm nhận quá
+    #       max(total_bay_demand / n_avail_blocks * SPREAD_FACTOR, MIN_THRESHOLD) containers.
+    #   - Phần vượt ngưỡng bị phạt nặng trong objective.
+
+    # Tính tổng demand (số container) cho mỗi vessel bay
+    bay_total_demand = {}
+    for (h, s, bay) in job_keys:
+        bay_total_demand[bay] = bay_total_demand.get(bay, 0) + sum(demands[(h, s, bay)].values())
+
+    # Tính số lượng block thực sự có hàng (supply) có thể phục vụ mỗi vessel bay
+    bay_eligible_blocks = {}
     for bay in all_bays:
-        prob += pulp.lpSum(block_bay[(b, bay)] for b in blocks) >= min_blocks_per_bay
+        eligible = set()
+        for (h, s, bj) in job_keys:
+            if bj != bay:
+                continue
+            for dkey in demands[(h, s, bay)]:
+                w, st_v, pod_v = dkey
+                for skey in supply_keys:
+                    b2, sup_st, sup_pod = skey
+                    if sup_st == st_v and sup_pod == pod_v and supply[skey][w] > 0:
+                        if (h, s, bay, b2, dkey) in x_vars:
+                            eligible.add(b2)
+        bay_eligible_blocks[bay] = eligible
+
+    # Tổng container được giao từ block b sang vessel bay (biểu thức tuyến tính)
+    blk_bay_total_expr = {}
+    for b in blocks:
+        for bay in all_bays:
+            relevant = [
+                x_vars[(h, s, bay, b, dkey)]
+                for (h, s, bj) in job_keys if bj == bay
+                for dkey in demands[(h, s, bay)]
+                if (h, s, bay, b, dkey) in x_vars
+            ]
+            if relevant:
+                blk_bay_total_expr[(b, bay)] = pulp.lpSum(relevant)
+
+    # Biến phạt: phần vượt ngưỡng của mỗi cặp (block, bay)
+    CONCENTRATION_W = 0.8   # trọng số cao để ngăn tập trung
+    LARGE_BAY_THRESHOLD = 20  # chỉ áp dụng logic phân tán khi bay có > 20 containers
+    SPREAD_FACTOR = 1.5     # một block có thể nhận tối đa SPREAD_FACTOR lần phần chia đều
+
+    blk_bay_excess_vars = {}
+    concentration_term_list = []
+
+    for bay in all_bays:
+        total_d = bay_total_demand.get(bay, 0)
+        if total_d <= LARGE_BAY_THRESHOLD:
+            continue  # bay nhỏ, không cần phân tán
+
+        n_eligible = max(len(bay_eligible_blocks.get(bay, set())), 2)
+        # Ngưỡng cho mỗi block: phần chia đều × SPREAD_FACTOR
+        fair_share = total_d / n_eligible
+        threshold = int(fair_share * SPREAD_FACTOR)
+        # Với bay rất lớn: không cho phép quá 50% tổng demand vào 1 block
+        if total_d > 40:
+            threshold = min(threshold, int(total_d * 0.50))
+        threshold = max(threshold, 1)  # tối thiểu 1
+
+        for b in blocks:
+            if (b, bay) not in blk_bay_total_expr:
+                continue
+            excess_var = pulp.LpVariable(f"bbt_excess_{b}_{bay}", lowBound=0, cat='Integer')
+            blk_bay_excess_vars[(b, bay)] = excess_var
+            # excess >= qty_assigned - threshold
+            prob += excess_var >= blk_bay_total_expr[(b, bay)] - threshold
+            concentration_term_list.append(excess_var)
+
+    concentration_penalty = (pulp.lpSum(concentration_term_list)
+                              if concentration_term_list else pulp.lpSum([]))
 
     # --- Hàm mục tiêu ---
+    CLASH_W  = 1.0
+    SINGLE_W = 0.3
+    SPREAD_W = 0.05
+    BLOCK_BAY_WC_W = 0.2   # trọng số phạt cho mỗi cặp (block, bay, wc)
+    BAY_SINGLE_W = 0.2      # trọng số phạt cho bay chỉ 1 block
+
     clash_term    = pulp.lpSum(e_vars.values())
     single_term   = pulp.lpSum(single_block.values())
     spread_term   = pulp.lpSum(block_bay.values())
@@ -446,7 +527,8 @@ def run_optimization(file_input):
              SINGLE_W * single_term +
              SPREAD_W * spread_term +
              BLOCK_BAY_WC_W * block_bay_wc_term +
-             BAY_SINGLE_W * bay_single_term)
+             BAY_SINGLE_W * bay_single_term +
+             CONCENTRATION_W * concentration_penalty)
 
     # ============================================================
     # 3b. Core constraints
@@ -706,34 +788,6 @@ def run_optimization(file_input):
     )
 
     # ============================================================
-    # 4c. Extract clash details for reporting (FIXED)
-    # ============================================================
-    clash_details = []
-    total_clashes = 0
-    for (h, b) in e_vars:
-        e_val = pulp.value(e_vars[(h, b)])
-        if e_val is not None and e_val > 0.5:
-            total_clashes += e_val
-            u_val = pulp.value(u_vars[(h, b)])
-            # Tìm các job (STS, BAY) mà block b phục vụ trong giờ h
-            jobs = []
-            for (s, bay) in jobs_by_hour.get(h, []):
-                y_key = (h, s, bay, b)
-                if y_key in y_vars and pulp.value(y_vars[y_key]) > 0.5:
-                    jobs.append(f"{s}@{bay}")
-            clash_details.append({
-                'MOVE HOUR': h,
-                'BLOCK': b,
-                'SỐ LƯỢNG BAY (u)': int(u_val) if u_val is not None else 0,
-                'CLASH (e = u-1)': int(e_val),
-                'DANH SÁCH JOB (STS@BAY)': ', '.join(jobs)
-            })
-    df_clash = pd.DataFrame(clash_details)
-    if not df_clash.empty:
-        df_clash.sort_values(['MOVE HOUR', 'BLOCK'], inplace=True)
-    print(f"Total clashes (e sum): {total_clashes}")
-
-    # ============================================================
     # 5. Prepare MATRIX data
     # ============================================================
     df_matrix_base = df_result.groupby(
@@ -841,41 +895,6 @@ def run_optimization(file_input):
     for r_idx, row in enumerate(df2.values, 2):
         for c_idx, val in enumerate(row, 1):
             ws_bw.cell(row=r_idx, column=c_idx, value=val if pd.notna(val) else None)
-
-    # ============================================================
-    # SHEET: CLASH (ALWAYS CREATED)
-    # ============================================================
-    ws_clash = wb.create_sheet('CLASH')
-    headers_clash = ['MOVE HOUR', 'BLOCK', 'SỐ LƯỢNG BAY (u)', 'CLASH (e = u-1)', 'DANH SÁCH JOB (STS@BAY)']
-    for c_idx, hdr in enumerate(headers_clash, 1):
-        cell = ws_clash.cell(row=1, column=c_idx, value=hdr)
-        cell.font = _font(bold=True, color=C_WHITE)
-        cell.fill = _fill(C_DARK_BLUE)
-        cell.alignment = _align()
-        cell.border = _thin_border()
-
-    if not df_clash.empty:
-        for r_idx, row in enumerate(df_clash.itertuples(index=False), 2):
-            for c_idx, val in enumerate(row, 1):
-                cell = ws_clash.cell(row=r_idx, column=c_idx, value=val)
-                cell.font = _font()
-                cell.fill = _fill(C_WHITE if r_idx % 2 == 0 else C_ALT_ROW)
-                cell.alignment = _align()
-                cell.border = _thin_border()
-    else:
-        # Ghi thông báo không có clash
-        cell = ws_clash.cell(row=2, column=1, value='Không có clash nào xảy ra.')
-        cell.font = _font()
-        cell.fill = _fill(C_WHITE)
-        cell.alignment = _align()
-        ws_clash.merge_cells(start_row=2, start_column=1, end_row=2, end_column=5)
-
-    # Độ rộng cột
-    ws_clash.column_dimensions['A'].width = 14
-    ws_clash.column_dimensions['B'].width = 12
-    ws_clash.column_dimensions['C'].width = 18
-    ws_clash.column_dimensions['D'].width = 18
-    ws_clash.column_dimensions['E'].width = 50
 
     # ============================================================
     # SHEET: RESULT (split per ST — one sheet per size type)
@@ -1392,5 +1411,6 @@ def run_optimization(file_input):
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     total_rows = len(df_result_detail)
-    print(f"Done. Rows={total_rows}, Total Clashes={total_clashes}")
-    return excel_buffer, total_rows, total_clashes
+    objective_value = int(pulp.value(prob.objective) or 0)
+    print(f"Done. Rows={total_rows}, Clashes={objective_value}")
+    return excel_buffer, total_rows, objective_value
