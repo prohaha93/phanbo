@@ -1,7 +1,6 @@
 import streamlit as st
 import io
 import pandas as pd
-import time  # Thêm thư viện time để đo thời gian
 
 # ============================================================
 # ADDED: Import hàm xử lý chính từ file ALLOCATION.py
@@ -11,9 +10,10 @@ from ALLOCATION import run_optimization
 # ==========================================
 # CẤU HÌNH GIAO DIỆN WEB
 # ==========================================
+# Đặt layout="centered" (mặc định) để nội dung không dàn trải
 st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="centered")
 
-# CSS thu gọn, căn giữa
+# Tùy chọn: thêm CSS để giới hạn chiều rộng nội dung và căn giữa
 st.markdown("""
     <style>
         .main > div {
@@ -35,9 +35,6 @@ if uploaded_file is not None:
     st.info("Đã nhận file. Bấm nút bên dưới để tiến hành tính toán.")
     
     if st.button("🚀 CHẠY THUẬT TOÁN TỐI ƯU", use_container_width=True):
-        # Ghi nhận thời gian bắt đầu
-        start_time = time.time()
-        
         with st.spinner('Hệ thống đang tính toán và xuất file... Vui lòng đợi!'):
             try:
                 # ==========================================================
@@ -46,17 +43,14 @@ if uploaded_file is not None:
                 # ==========================================================
                 excel_buffer, total_rows, objective_value = run_optimization(uploaded_file)
                 
-                # Tính thời gian đã chạy
-                elapsed_time = time.time() - start_time
-                
-                # Hiển thị thông báo hoàn thành kèm thời gian
-                st.success(f"✅ Tính toán hoàn tất! Thời gian xử lý: {elapsed_time:.2f} giây")
+                st.success("✅ Tính toán hoàn tất!")
                 
                 # ==========================================================
                 # Hiển thị thống kê ngắn gọn
                 # ==========================================================
                 col1, col2 = st.columns(2)
                 col1.metric("Tổng số dòng phân bổ", f"{total_rows} dòng")
+                # objective_value là tổng số clash (càng nhỏ càng tốt), nếu bằng 0 là không có clash
                 col2.metric("Số lượng Clash (giá trị mục tiêu)", f"{objective_value}", delta_color="inverse")
                 
                 # ==========================================================
@@ -71,6 +65,7 @@ if uploaded_file is not None:
                 )
 
             except Exception as e:
-                # Trường hợp lỗi: vẫn tính thời gian (tuỳ chọn) và thông báo lỗi
-                elapsed_time = time.time() - start_time
-                st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nThời gian xử lý đến khi lỗi: {elapsed_time:.2f} giây\nChi tiết lỗi: {e}")
+                # ==========================================================
+                # MODIFIED: Bắt lỗi và hiển thị chi tiết
+                # ==========================================================
+                st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nChi tiết lỗi: {e}")
