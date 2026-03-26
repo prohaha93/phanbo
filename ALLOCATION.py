@@ -63,16 +63,7 @@ def _style(ws, coord, value=None, bold=False, font_color="FF000000",
 # ============================================================
 def run_optimization(file_input):
     """
-    Chạy thuật toán phân bổ tối ưu (ĐÃ CẢI TIẾN).
-
-    CẢI TIẾN CHÍNH THEO YÊU CẦU:
-    1. Tăng mạnh SPREAD_W → Block chỉ phục vụ ÍT vessel BAY nhất có thể.
-       → Nếu đã dùng block cho 1 BAY thì ưu tiên dứt điểm lấy hết BAY đó
-         trước khi chuyển sang BAY khác trong cùng block (giảm rải rác 02→64).
-    2. Tăng mạnh SINGLE_W → Mỗi vessel BAY (deck) ưu tiên dùng TỪ 2 BLOCK trở lên
-       (tránh dồn quá nhiều hàng lên 1 block duy nhất).
-    3. CLASH_W vẫn cao nhất → Vẫn đảm bảo ít clash nhất có thể (ưu tiên tuyệt đối).
-    4. Báo cáo objective_value giờ là SỐ CLASH THỰC TẾ (không bị lẫn weight).
+    Chạy thuật toán phân bổ tối ưu.
 
     Parameters
     ----------
@@ -86,7 +77,7 @@ def run_optimization(file_input):
     total_rows : int
         Tổng số dòng phân bổ trong sheet RESULT.
     objective_value : int
-        Số lượng clash thực tế (0 = không có clash).
+        Số lượng clash (0 = không có clash).
     """
     # ============================================================
     # 1. Read and parse original data
@@ -385,17 +376,18 @@ def run_optimization(file_input):
     # ============================================================
     # 3a. Objective: minimise clashes + movement penalties
     # ============================================================
-    # ──────────────────────────────────────────────────────────────
-    # CẢI TIẾN TRỌNG SỐ (theo yêu cầu người dùng)
-    # ──────────────────────────────────────────────────────────────
-    #   CLASH_W      : clash cost (ưu tiên tuyệt đối)
-    #   SINGLE_W     : phạt mạnh khi vessel BAY chỉ dùng 1 block
-    #                  → khuyến khích ≥2 blocks / BAY (không dồn quá nhiều lên 1 block)
-    #   SPREAD_W     : phạt mạnh khi 1 block phục vụ nhiều vessel BAY
-    #                  → block sẽ dứt điểm 1 BAY trước khi chuyển sang BAY khác
-    CLASH_W  = 1000.0   # RẤT CAO → clash luôn là ưu tiên số 1, không bao giờ tăng clash để giảm spread
-    SINGLE_W = 10.0     # MẠNH → vessel BAY ưu tiên dùng ≥2 blocks
-    SPREAD_W = 5.0      # MẠNH → block tập trung phục vụ ít BAY nhất có thể (giảm rải rác 02-64)
+    # Weight tuning:
+    #   CLASH_W      : clash cost (highest priority)
+    #   SINGLE_W     : penalty when a vessel bay uses only 1 block
+    #                  → encourage ≥2 blocks per bay (spread yard movements)
+    #   SPREAD_W     : penalty per distinct vessel-bay a block serves
+    #                  → encourage each block to focus on fewer bays
+    #   BALANCE_W    : penalty when 1 block cung cấp >50% nhu cầu của 1 vessel bay
+    #                  → tránh dồn quá nhiều vào 1 block cho 1 bay tàu
+    CLASH_W   = 1.0
+    SINGLE_W  = 0.5    # tăng từ 0.3 → mạnh hơn, ưu tiên dùng ≥2 block/bay tàu
+    SPREAD_W  = 0.05   # small: prefer concentrated block movement
+    BALANCE_W = 0.25   # mới: phạt khi 1 block chiếm >50% demand của 1 vessel bay
 
     # single_block[h,s,bay] = 1 if only 1 block serves this job
     # Constraint: single_block >= 2 - sum_b(y[h,s,bay,b])
@@ -421,12 +413,47 @@ def run_optimization(file_input):
                 if bj == bay:
                     prob += var >= y_vars[(h, s, bay, b)]
 
+    # ── Hard constraint: số block tối đa mỗi vessel bay ─────────────────────
+    # Giới hạn cứng: mỗi vessel bay chỉ được lấy hàng từ tối đa MAX_BLOCKS_PER_BAY block
+    # (tính trên toàn bộ các giờ). Mục tiêu: tránh tình trạng 1 bay tập hợp quá nhiều
+    # block rải rác (ví dụ bay 62 lấy từ 6-7 block), tập trung vào 2-3 block hợp lý.
+    # Nếu solver báo infeasible → tăng MAX_BLOCKS_PER_BAY lên 4.
+    MAX_BLOCKS_PER_BAY = 3
+    for bay in all_bays:
+        prob += (
+            pulp.lpSum(block_bay[(b, bay)] for b in blocks) <= MAX_BLOCKS_PER_BAY,
+            f"max_blocks_bay_{bay}"
+        )
+    print(f"Block-per-bay hard cap: {MAX_BLOCKS_PER_BAY} blocks/vessel bay")
+
+    # over_share[h,s,bay,b]: phần vượt quá 1/MAX_BLOCKS khi 1 block chiếm quá nhiều
+    # Trong giới hạn MAX_BLOCKS_PER_BAY block, mục tiêu phân bổ đều giữa các block.
+    # Threshold = 1/MAX_BLOCKS_PER_BAY (nếu 3 block → mỗi block lý tưởng ~33%)
+    over_share = {}
+    for (h, s, bay) in job_keys:
+        total_d = sum(demands[(h, s, bay)].values())
+        if total_d <= 1:
+            continue
+        threshold = total_d / MAX_BLOCKS_PER_BAY   # phần đều nhau nếu đủ block
+        for b in blocks:
+            relevant_x = [x_vars[(h, s, bay, b, dk)]
+                          for dk in demands[(h, s, bay)]
+                          if (h, s, bay, b, dk) in x_vars]
+            if not relevant_x:
+                continue
+            v = pulp.LpVariable(f"os_{h}_{s}_{bay}_{b}", lowBound=0)
+            over_share[(h, s, bay, b)] = v
+            prob += v >= pulp.lpSum(relevant_x) - threshold
+
     clash_term    = pulp.lpSum(e_vars.values())
     single_term   = pulp.lpSum(single_block.values())
     spread_term   = pulp.lpSum(block_bay.values())
+    balance_term  = pulp.lpSum(over_share.values()) if over_share else 0
 
-    # Objective: clash tuyệt đối + phạt spread/single
-    prob += CLASH_W * clash_term + SINGLE_W * single_term + SPREAD_W * spread_term
+    prob += (CLASH_W  * clash_term
+           + SINGLE_W * single_term
+           + SPREAD_W * spread_term
+           + BALANCE_W * balance_term)
 
     # ============================================================
     # 3b. Core constraints
@@ -469,17 +496,38 @@ def run_optimization(file_input):
 
     # NOTE: YB concentration and physical tier-ordering enforced by greedy post-processor.
 
-    # 3d. Solve
+    # 3d. Solve with auto-fallback if block-per-bay cap is too tight
     # ============================================================
     solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300)
-    prob.solve(solver)
 
+    effective_cap = MAX_BLOCKS_PER_BAY
+    prob.solve(solver)
     status = prob.status
-    print(f"Status: {pulp.LpStatus[status]}")
-    if status == pulp.LpStatusInfeasible:
-        raise RuntimeError("Model infeasible — kiểm tra supply/demand và ràng buộc.")
+    print(f"Status (cap={effective_cap}): {pulp.LpStatus[status]}")
+
+    # If infeasible, progressively relax the block-per-bay cap
+    for fallback_cap in [MAX_BLOCKS_PER_BAY + 1, MAX_BLOCKS_PER_BAY + 2, len(blocks)]:
+        if status != pulp.constants.LpStatusInfeasible:
+            break
+        print(f"  Infeasible at cap={effective_cap}, thu noi long len cap={fallback_cap}...")
+        for bay in all_bays:
+            cname = f"max_blocks_bay_{bay}"
+            if cname in prob.constraints:
+                del prob.constraints[cname]
+            prob += (
+                pulp.lpSum(block_bay[(b, bay)] for b in blocks) <= fallback_cap,
+                cname
+            )
+        effective_cap = fallback_cap
+        prob.solve(solver)
+        status = prob.status
+        print(f"  Status (cap={effective_cap}): {pulp.LpStatus[status]}")
+
+    if status == pulp.constants.LpStatusInfeasible:
+        raise RuntimeError("Model infeasible — kiem tra supply/demand va rang buoc.")
     elif status not in (1,):
         print("No optimal solution found within time limit – using best solution found.")
+    print(f"Effective block-per-bay cap used: {effective_cap}")
 
     # ============================================================
     # 4. Extract result  +  map individual containers to each assignment
@@ -542,11 +590,16 @@ def run_optimization(file_input):
                 'picked': False, 'pick_h': None
             })
 
-        # ── Sticky YB tracker ────────────────────────────────────────────────
-        # opened_ybs[(block, yb)] = True  khi đã bắt đầu lấy từ YB này
-        # YB đã được "mở" (partially picked) sẽ được ưu tiên cao nhất,
-        # để dứt điểm lấy hết trước khi chuyển sang YB mới trong cùng block.
+        # ── YB exhaustion tracker ─────────────────────────────────────────────
+        # CẢI TIẾN 1: Thay vì chỉ "ưu tiên" YB đã mở, nay KHÓA cứng vào YB đó
+        # cho đến khi lấy hết hoàn toàn (không còn container truy cập được),
+        # rồi mới chuyển sang YB tiếp theo → tránh di chuyển rải rác giữa YBs.
+        #
+        # opened_ybs  : set (block, yb) đã từng bắt đầu lấy
+        # active_yb   : dict (block, wc) → yb đang được drain (KHÓA cứng)
+        #               Chỉ giải phóng khi yb hết container truy cập được.
         opened_ybs = set()   # (block, yb) pairs that have been started
+        active_yb  = {}      # (block, wc) → current YB being actively drained
 
         def accessible_at(cont, containers, h_rank_val):
             for c in containers:
@@ -561,13 +614,20 @@ def run_optimization(file_input):
 
         def pick_n(block, wc, st_match, pod_match, qty, h, s_job, bay_job, h_rank_val, result_list):
             """
-            Pick qty containers of (wc, st_match) from block, with priority:
-              P0. STICKY YB: YB đã được mở (partially picked) → ưu tiên tuyệt đối
-                  để dứt điểm 1 YB trước khi sang YB mới (tránh di chuyển rải rác).
-              P1. YB mới: chọn YB có nhiều container nhất (concentrate per YB).
-              P2. Within YB: lowest YR first (row 1 → 7).
-              P3. Within row: highest YT first (top → bottom, no re-handling).
-            Incremental: re-evaluate after each pick.
+            Pick qty containers of (wc, st_match, pod_match) from block.
+
+            CẢI TIẾN - Chiến lược KHÓA YB (active_yb):
+              P0. ACTIVE YB (KHÓA CỨNG): Nếu (block, wc) đang có active_yb,
+                  CHỈ lấy từ YB đó. Không chuyển sang YB khác cho dù YB khác
+                  có nhiều container hơn. Chỉ giải phóng khi active YB hết
+                  container truy cập được → tránh di chuyển rải rác.
+              P1. OPENED YB (đã mở trước): Nếu chưa có active_yb, ưu tiên YB
+                  nào đã mở trước (có số container truy cập được nhiều nhất
+                  trong nhóm đó).
+              P2. NEW YB: Nếu không có YB nào đã mở, chọn YB mới có nhiều
+                  container truy cập được nhất → concentrate per YB.
+              P3. Trong cùng 1 YB: YR thấp nhất trước (row 1→7),
+                  tier cao nhất trước (top-of-stack → bottom, no re-handling).
             """
             containers = pool[block]
             remaining = qty
@@ -577,37 +637,56 @@ def run_optimization(file_input):
                 if pod_match and c.get('pod','') != pod_match: return False
                 return True
             while remaining > 0:
-                cands = [c for c in containers
-                         if not c['picked'] and matches(c)
-                         and accessible_at(c, containers, h_rank_val)]
-                if not cands:
+                all_cands = [c for c in containers
+                             if not c['picked'] and matches(c)
+                             and accessible_at(c, containers, h_rank_val)]
+                if not all_cands:
                     break
-                # Count accessible matching containers per YB
-                yb_cnt = {}
-                for c in cands:
-                    yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
-                # Sort key:
-                #   P0: sticky=0 (already opened) beats sticky=1 (fresh YB)
-                #   P1: most containers in YB (descending)
-                #   P2: lower YB id (tie-break, consistent ordering)
-                #   P3: lower YR (row 1 → 7)
-                #   P4: highest tier first
-                cands.sort(key=lambda c: (
-                    0 if (block, c['yb']) in opened_ybs else 1,  # P0: sticky first
-                    -yb_cnt[c['yb']],  # P1: most-loaded YB first
-                    c['yb'],           # P2: tie-break YB id
-                    c['yr'],           # P3: row 1 → 7
-                    -c['yt']           # P4: highest tier first
-                ))
-                best = cands[0]
+
+                # ── P0: KHÓA vào active YB nếu đang có ──────────────────────
+                bw_key = (block, wc)
+                cur_yb = active_yb.get(bw_key)
+
+                if cur_yb is not None:
+                    yb_cands = [c for c in all_cands if c['yb'] == cur_yb]
+                    if not yb_cands:
+                        # Active YB đã hết container truy cập được → giải phóng
+                        del active_yb[bw_key]
+                        cur_yb = None
+                    # else: yb_cands sẽ được dùng bên dưới
+
+                if cur_yb is None:
+                    # ── P1: Ưu tiên YB đã mở trước (opened) ─────────────────
+                    yb_cnt = {}
+                    for c in all_cands:
+                        yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
+
+                    opened_in_block = {yb for (blk, yb) in opened_ybs if blk == block}
+                    opened_available = opened_in_block & set(yb_cnt.keys())
+
+                    if opened_available:
+                        # Chọn opened YB có nhiều container truy cập được nhất
+                        best_yb = max(opened_available,
+                                      key=lambda yb: (yb_cnt[yb], -yb))
+                    else:
+                        # ── P2: New YB — chọn YB có nhiều container nhất ─────
+                        best_yb = max(yb_cnt, key=lambda yb: (yb_cnt[yb], -yb))
+
+                    active_yb[bw_key] = best_yb          # KHÓA vào YB mới chọn
+                    yb_cands = [c for c in all_cands if c['yb'] == best_yb]
+
+                # ── P3: Trong YB đã chọn: YR thấp nhất, tier cao nhất ───────
+                yb_cands.sort(key=lambda c: (c['yr'], -c['yt']))
+                best = yb_cands[0]
+
                 best['picked'] = True
                 best['pick_h'] = h
-                opened_ybs.add((block, best['yb']))   # mark YB as opened
+                opened_ybs.add((block, best['yb']))
                 result_list.append({
                     'MOVE HOUR':      h,
                     'CONTAINER ID':   best['real_cont_id'],
-                    'ST':             best.get('st', st_match),   # actual ST from container
-                    'POD':            best.get('pod', pod_match),  # actual POD from container
+                    'ST':             best.get('st', st_match),
+                    'POD':            best.get('pod', pod_match),
                     'STS': s_job,     'BAY': bay_job,
                     'ASSIGNED BLOCK': block,
                     'WEIGHT CLASS':   wc,
@@ -1310,12 +1389,6 @@ def run_optimization(file_input):
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     total_rows = len(df_result_detail)
-    
-    # ──────────────────────────────────────────────────────────────
-    # CẢI TIẾN: objective_value giờ là SỐ CLASH THỰC TẾ (không bị lẫn weight)
-    # ──────────────────────────────────────────────────────────────
-    clash_count = int(pulp.value(clash_term) or 0)
-    objective_value = clash_count
-    print(f"Done. Rows={total_rows}, Clashes (thực tế)={objective_value} "
-          f"(weighted objective={int(pulp.value(prob.objective) or 0)})")
+    objective_value = int(pulp.value(prob.objective) or 0)
+    print(f"Done. Rows={total_rows}, Clashes={objective_value}")
     return excel_buffer, total_rows, objective_value
