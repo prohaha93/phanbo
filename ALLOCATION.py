@@ -1,4 +1,3 @@
-import time
 import io
 import pandas as pd
 import numpy as np
@@ -1039,12 +1038,7 @@ def run_optimization(file_input):
 
     for c in range(1, total_detail_cols + 2):
         ws_detail.column_dimensions[get_column_letter(c)].width = 8
-    # Sau khi tạo xong các sheet, trước khi return:
-    elapsed_time = time.time() - start_time
-    print(f"Total execution time: {elapsed_time:.2f} seconds")
-    
-    # Trả về thêm elapsed_time
-    return excel_buffer, total_rows, total_clashes, elapsed_time
+
     # ============================================================
     # 8. Save to BytesIO
     # ============================================================
