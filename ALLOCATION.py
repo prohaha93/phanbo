@@ -56,6 +56,8 @@ def _style(ws, coord, value=None, bold=False, font_color="FF000000",
         cell.border = _thin_border()
     return cell
 
+
+
 # ============================================================
 # PUBLIC API — called by WEBAPP.PY
 # ============================================================
@@ -177,6 +179,7 @@ def run_optimization(file_input):
     supply_keys = [k for k in supply if any(supply[k][w] > 0 for w in weight_classes)]
     print(f"Supply format: {'BLOCK+ST+POD' if has_st_pod_supply else 'BLOCK only (legacy)'}")
     print(f"Supply keys: {len(supply_keys)} (block×ST×POD combinations)")
+
 
     # --- Sheet 3 (DATA file): container-level layout ---
     # Column mapping (TEST2.xlsx):
@@ -373,12 +376,17 @@ def run_optimization(file_input):
     # ============================================================
     # 3a. Objective: minimise clashes + movement penalties
     # ============================================================
-    # Weight tuning (cải tiến: tăng mạnh trọng số để khuyến khích phân bổ đều)
-    CLASH_W  = 100.0    # ưu tiên cao nhất: giảm clash
-    SINGLE_W = 10.0     # phạt nặng nếu job chỉ dùng 1 block
-    SPREAD_W = 5.0      # phạt mỗi cặp (block, bay) → hạn chế một block phục vụ nhiều bay
-    BLOCK_BAY_WC_W = 2.0
-    BAY_SINGLE_W = 10.0   # phạt nặng nếu bay chỉ có 1 block
+    # Weight tuning:
+    #   CLASH_W   : clash cost (highest priority)
+    #   SINGLE_W  : penalty khi 1 (hour,bay) chi dung 1 block   → khuyen khich >= 2
+    #   SPREAD_W  : penalty moi (block, vessel-bay) pair        → giam lan tran block
+    #   EXTRA_W   : penalty tuyen tinh cho moi block thu 3+ trong cung 1 (hour,bay)
+    #               Khong phai hard cap → KHONG gay infeasible.
+    #               Chinh sach: 1 block = 0, 2 block = 0, 3 block = 1x, 4 block = 2x, ...
+    CLASH_W  = 1.0
+    SINGLE_W = 0.5
+    SPREAD_W = 0.05
+    EXTRA_W  = 0.4   # penalty moi block vuot qua 2 trong 1 (hour,bay)
 
     # single_block[h,s,bay] = 1 if only 1 block serves this job
     # Constraint: single_block >= 2 - sum_b(y[h,s,bay,b])
@@ -392,8 +400,8 @@ def run_optimization(file_input):
             2 - pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks)
         )
 
-    # block_bay[b, bay] = 1 if block b serves ANY job at vessel bay 'bay'
-    # Constraint: block_bay[b,bay] >= y[h,s,bay,b]  for each h,s
+    # block_bay[b, bay] = 1 if block b serves ANY hour of vessel bay 'bay'
+    # Dung cho spread_term (penalty mem).
     all_bays = sorted(set(bay for (_, _, bay) in job_keys))
     block_bay = {}
     for b in blocks:
@@ -404,49 +412,25 @@ def run_optimization(file_input):
                 if bj == bay:
                     prob += var >= y_vars[(h, s, bay, b)]
 
-    # ========== CẢI TIẾN 1: Hạn chế một block phục vụ quá nhiều (bay, weight class) ==========
-    block_bay_wc = {}
-    for b in blocks:
-        for bay in all_bays:
-            for wc in weight_classes:
-                var = pulp.LpVariable(f"bbw_{b}_{bay}_{wc}", cat='Binary')
-                block_bay_wc[(b, bay, wc)] = var
-                # Liên kết var với x_vars: nếu có x_vars nào dùng (b, bay, wc) thì var >= 1
-                for (h, s, bj) in job_keys:
-                    if bj == bay:
-                        for dkey in demands[(h, s, bay)]:
-                            w, st_v, pod_v = dkey
-                            if w == wc:
-                                key_x = (h, s, bay, b, dkey)
-                                if key_x in x_vars:
-                                    # Dùng demand làm hệ số lớn-M: nếu x>0 thì var phải >= 1
-                                    prob += var >= x_vars[key_x] / (demands[(h, s, bay)][dkey] + 0.1)
+    # extra_blocks[(h,s,bay)]: so block VUOT QUA 2 trong (hour, bay).
+    # extra_blocks >= sum_b(y[h,s,bay,b]) - 2   (neu dung <= 2 block thi = 0)
+    # KHONG phai hard cap → solver LUON co the dung nhieu block hon neu can,
+    # nhung moi block thu 3+ bi phat EXTRA_W → tu nhien gom lai con 2-3 block.
+    extra_blocks = {}
+    for (h, s, bay) in job_keys:
+        v = pulp.LpVariable(f"eb_{h}_{s}_{bay}", lowBound=0)
+        extra_blocks[(h, s, bay)] = v
+        prob += v >= pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks) - 2
 
-    # ========== CẢI TIẾN 2: Khuyến khích mỗi bay có ít nhất 2 block ==========
-    bay_single = {}
-    for bay in all_bays:
-        var = pulp.LpVariable(f"bs_{bay}", lowBound=0, upBound=1, cat='Continuous')
-        bay_single[bay] = var
-        total_blocks_bay = pulp.lpSum(block_bay[(b, bay)] for b in blocks)
-        prob += var >= (2 - total_blocks_bay)
+    clash_term  = pulp.lpSum(e_vars.values())
+    single_term = pulp.lpSum(single_block.values())
+    spread_term = pulp.lpSum(block_bay.values())
+    extra_term  = pulp.lpSum(extra_blocks.values())
 
-    # ========== RÀNG BUỘC CỨNG: MỖI BAY PHẢI CÓ ÍT NHẤT 2 BLOCK ==========
-    min_blocks_per_bay = 2
-    for bay in all_bays:
-        prob += pulp.lpSum(block_bay[(b, bay)] for b in blocks) >= min_blocks_per_bay
-
-    # --- Hàm mục tiêu ---
-    clash_term    = pulp.lpSum(e_vars.values())
-    single_term   = pulp.lpSum(single_block.values())
-    spread_term   = pulp.lpSum(block_bay.values())
-    block_bay_wc_term = pulp.lpSum(block_bay_wc.values())
-    bay_single_term   = pulp.lpSum(bay_single.values())
-
-    prob += (CLASH_W * clash_term +
-             SINGLE_W * single_term +
-             SPREAD_W * spread_term +
-             BLOCK_BAY_WC_W * block_bay_wc_term +
-             BAY_SINGLE_W * bay_single_term)
+    prob += (CLASH_W  * clash_term
+           + SINGLE_W * single_term
+           + SPREAD_W * spread_term
+           + EXTRA_W  * extra_term)
 
     # ============================================================
     # 3b. Core constraints
@@ -493,11 +477,10 @@ def run_optimization(file_input):
     # ============================================================
     solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300)
     prob.solve(solver)
-
     status = prob.status
     print(f"Status: {pulp.LpStatus[status]}")
     if status == pulp.LpStatusInfeasible:
-        raise RuntimeError("Model infeasible — kiểm tra supply/demand và ràng buộc.")
+        raise RuntimeError("Model infeasible — kiem tra supply/demand va rang buoc.")
     elif status not in (1,):
         print("No optimal solution found within time limit – using best solution found.")
 
@@ -562,11 +545,16 @@ def run_optimization(file_input):
                 'picked': False, 'pick_h': None
             })
 
-        # ── Sticky YB tracker ────────────────────────────────────────────────
-        # opened_ybs[(block, yb)] = True  khi đã bắt đầu lấy từ YB này
-        # YB đã được "mở" (partially picked) sẽ được ưu tiên cao nhất,
-        # để dứt điểm lấy hết trước khi chuyển sang YB mới trong cùng block.
-        opened_ybs = set()   # (block, yb) pairs that have been started
+        # ── Tracker KHÓA YB và ROW ───────────────────────────────────────────
+        # Nguyên tắc: lấy hết 1 ROW trước khi chuyển row, hết 1 YB trước
+        # khi chuyển YB → tránh mỗi nơi 1-2 cont, di chuyển lắt nhắt.
+        #
+        # opened_ybs : set (block, yb) đã từng bắt đầu lấy
+        # active_yb  : (block, wc)     → yb đang drain (KHÓA cứng)
+        # active_yr  : (block, wc, yb) → yr đang drain (KHÓA cứng trong YB)
+        opened_ybs = set()
+        active_yb  = {}   # (block, wc)      → cur_yb
+        active_yr  = {}   # (block, wc, yb)  → cur_yr
 
         def accessible_at(cont, containers, h_rank_val):
             for c in containers:
@@ -580,15 +568,6 @@ def run_optimization(file_input):
             return True
 
         def pick_n(block, wc, st_match, pod_match, qty, h, s_job, bay_job, h_rank_val, result_list):
-            """
-            Pick qty containers of (wc, st_match) from block, with priority:
-              P0. STICKY YB: YB đã được mở (partially picked) → ưu tiên tuyệt đối
-                  để dứt điểm 1 YB trước khi sang YB mới (tránh di chuyển rải rác).
-              P1. YB mới: chọn YB có nhiều container nhất (concentrate per YB).
-              P2. Within YB: lowest YR first (row 1 → 7).
-              P3. Within row: highest YT first (top → bottom, no re-handling).
-            Incremental: re-evaluate after each pick.
-            """
             containers = pool[block]
             remaining = qty
             def matches(c):
@@ -596,38 +575,70 @@ def run_optimization(file_input):
                 if st_match  and c.get('st','')  != st_match:  return False
                 if pod_match and c.get('pod','') != pod_match: return False
                 return True
+
             while remaining > 0:
-                cands = [c for c in containers
-                         if not c['picked'] and matches(c)
-                         and accessible_at(c, containers, h_rank_val)]
-                if not cands:
+                all_cands = [c for c in containers
+                             if not c['picked'] and matches(c)
+                             and accessible_at(c, containers, h_rank_val)]
+                if not all_cands:
                     break
-                # Count accessible matching containers per YB
-                yb_cnt = {}
-                for c in cands:
-                    yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
-                # Sort key:
-                #   P0: sticky=0 (already opened) beats sticky=1 (fresh YB)
-                #   P1: most containers in YB (descending)
-                #   P2: lower YB id (tie-break, consistent ordering)
-                #   P3: lower YR (row 1 → 7)
-                #   P4: highest tier first
-                cands.sort(key=lambda c: (
-                    0 if (block, c['yb']) in opened_ybs else 1,  # P0: sticky first
-                    -yb_cnt[c['yb']],  # P1: most-loaded YB first
-                    c['yb'],           # P2: tie-break YB id
-                    c['yr'],           # P3: row 1 → 7
-                    -c['yt']           # P4: highest tier first
-                ))
-                best = cands[0]
+
+                # ── Xác định / giải phóng active YB ─────────────────────────
+                bw_key = (block, wc)
+                cur_yb = active_yb.get(bw_key)
+                if cur_yb is not None:
+                    yb_cands = [c for c in all_cands if c['yb'] == cur_yb]
+                    if not yb_cands:
+                        # YB hết container truy cập được → giải phóng YB + YR
+                        del active_yb[bw_key]
+                        active_yr.pop((block, wc, cur_yb), None)
+                        cur_yb = None
+                if cur_yb is None:
+                    # Chọn YB mới: ưu tiên đã mở, sau đó nhiều container nhất
+                    yb_cnt = {}
+                    for c in all_cands:
+                        yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
+                    opened_in_block = {yb for (blk, yb) in opened_ybs if blk == block}
+                    opened_available = opened_in_block & set(yb_cnt.keys())
+                    if opened_available:
+                        cur_yb = max(opened_available, key=lambda yb: (yb_cnt[yb], -yb))
+                    else:
+                        cur_yb = max(yb_cnt, key=lambda yb: (yb_cnt[yb], -yb))
+                    active_yb[bw_key] = cur_yb
+
+                yb_cands = [c for c in all_cands if c['yb'] == cur_yb]
+
+                # ── Xác định / giải phóng active ROW trong YB ───────────────
+                bwy_key = (block, wc, cur_yb)
+                cur_yr = active_yr.get(bwy_key)
+                if cur_yr is not None:
+                    yr_cands = [c for c in yb_cands if c['yr'] == cur_yr]
+                    if not yr_cands:
+                        # Row hết container truy cập được → giải phóng
+                        del active_yr[bwy_key]
+                        cur_yr = None
+                if cur_yr is None:
+                    # Chọn row mới: nhiều container nhất (tie-break: số nhỏ nhất)
+                    yr_cnt = {}
+                    for c in yb_cands:
+                        yr_cnt[c['yr']] = yr_cnt.get(c['yr'], 0) + 1
+                    cur_yr = max(yr_cnt, key=lambda yr: (yr_cnt[yr], -yr))
+                    active_yr[bwy_key] = cur_yr
+
+                yr_cands = [c for c in yb_cands if c['yr'] == cur_yr]
+
+                # ── Trong row: tier cao nhất trước (no re-handling) ──────────
+                yr_cands.sort(key=lambda c: -c['yt'])
+                best = yr_cands[0]
+
                 best['picked'] = True
                 best['pick_h'] = h
-                opened_ybs.add((block, best['yb']))   # mark YB as opened
+                opened_ybs.add((block, cur_yb))
                 result_list.append({
                     'MOVE HOUR':      h,
                     'CONTAINER ID':   best['real_cont_id'],
-                    'ST':             best.get('st', st_match),   # actual ST from container
-                    'POD':            best.get('pod', pod_match),  # actual POD from container
+                    'ST':             best.get('st', st_match),
+                    'POD':            best.get('pod', pod_match),
                     'STS': s_job,     'BAY': bay_job,
                     'ASSIGNED BLOCK': block,
                     'WEIGHT CLASS':   wc,
@@ -704,6 +715,7 @@ def run_optimization(file_input):
         ['MOVE HOUR', 'STS', 'BAY', 'ASSIGNED BLOCK', 'WEIGHT CLASS', 'YB', 'YR', 'YT'],
         inplace=True
     )
+
 
     # ============================================================
     # 5. Prepare MATRIX data
