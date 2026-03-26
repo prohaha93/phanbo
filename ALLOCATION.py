@@ -74,8 +74,8 @@ def run_optimization(file_input):
         File Excel kết quả sẵn sàng để download.
     total_rows : int
         Tổng số dòng phân bổ trong sheet RESULT.
-    objective_value : int
-        Số lượng clash (0 = không có clash).
+    total_clashes : int
+        Số lượng clash thực tế (tổng e_vars).
     """
     # ============================================================
     # 1. Read and parse original data
@@ -706,13 +706,15 @@ def run_optimization(file_input):
     )
 
     # ============================================================
-    # 4c. Extract clash details for reporting (NEW)
+    # 4c. Extract clash details for reporting (FIXED)
     # ============================================================
     clash_details = []
-    for (h, b) in u_vars:
-        u_val = pulp.value(u_vars[(h, b)])
+    total_clashes = 0
+    for (h, b) in e_vars:
         e_val = pulp.value(e_vars[(h, b)])
-        if u_val is not None and u_val > 1:
+        if e_val is not None and e_val > 0.5:
+            total_clashes += e_val
+            u_val = pulp.value(u_vars[(h, b)])
             # Tìm các job (STS, BAY) mà block b phục vụ trong giờ h
             jobs = []
             for (s, bay) in jobs_by_hour.get(h, []):
@@ -722,13 +724,14 @@ def run_optimization(file_input):
             clash_details.append({
                 'MOVE HOUR': h,
                 'BLOCK': b,
-                'SỐ LƯỢNG BAY (u)': int(u_val),
+                'SỐ LƯỢNG BAY (u)': int(u_val) if u_val is not None else 0,
                 'CLASH (e = u-1)': int(e_val),
                 'DANH SÁCH JOB (STS@BAY)': ', '.join(jobs)
             })
     df_clash = pd.DataFrame(clash_details)
     if not df_clash.empty:
         df_clash.sort_values(['MOVE HOUR', 'BLOCK'], inplace=True)
+    print(f"Total clashes (e sum): {total_clashes}")
 
     # ============================================================
     # 5. Prepare MATRIX data
@@ -840,17 +843,18 @@ def run_optimization(file_input):
             ws_bw.cell(row=r_idx, column=c_idx, value=val if pd.notna(val) else None)
 
     # ============================================================
-    # SHEET: CLASH (NEW)
+    # SHEET: CLASH (ALWAYS CREATED)
     # ============================================================
+    ws_clash = wb.create_sheet('CLASH')
+    headers_clash = ['MOVE HOUR', 'BLOCK', 'SỐ LƯỢNG BAY (u)', 'CLASH (e = u-1)', 'DANH SÁCH JOB (STS@BAY)']
+    for c_idx, hdr in enumerate(headers_clash, 1):
+        cell = ws_clash.cell(row=1, column=c_idx, value=hdr)
+        cell.font = _font(bold=True, color=C_WHITE)
+        cell.fill = _fill(C_DARK_BLUE)
+        cell.alignment = _align()
+        cell.border = _thin_border()
+
     if not df_clash.empty:
-        ws_clash = wb.create_sheet('CLASH')
-        headers = list(df_clash.columns)
-        for c_idx, hdr in enumerate(headers, 1):
-            cell = ws_clash.cell(row=1, column=c_idx, value=hdr)
-            cell.font = _font(bold=True, color=C_WHITE)
-            cell.fill = _fill(C_DARK_BLUE)
-            cell.alignment = _align()
-            cell.border = _thin_border()
         for r_idx, row in enumerate(df_clash.itertuples(index=False), 2):
             for c_idx, val in enumerate(row, 1):
                 cell = ws_clash.cell(row=r_idx, column=c_idx, value=val)
@@ -858,12 +862,20 @@ def run_optimization(file_input):
                 cell.fill = _fill(C_WHITE if r_idx % 2 == 0 else C_ALT_ROW)
                 cell.alignment = _align()
                 cell.border = _thin_border()
-        # Độ rộng cột
-        ws_clash.column_dimensions['A'].width = 14   # MOVE HOUR
-        ws_clash.column_dimensions['B'].width = 12   # BLOCK
-        ws_clash.column_dimensions['C'].width = 18   # SỐ LƯỢNG BAY (u)
-        ws_clash.column_dimensions['D'].width = 18   # CLASH (e = u-1)
-        ws_clash.column_dimensions['E'].width = 50   # DANH SÁCH JOB
+    else:
+        # Ghi thông báo không có clash
+        cell = ws_clash.cell(row=2, column=1, value='Không có clash nào xảy ra.')
+        cell.font = _font()
+        cell.fill = _fill(C_WHITE)
+        cell.alignment = _align()
+        ws_clash.merge_cells(start_row=2, start_column=1, end_row=2, end_column=5)
+
+    # Độ rộng cột
+    ws_clash.column_dimensions['A'].width = 14
+    ws_clash.column_dimensions['B'].width = 12
+    ws_clash.column_dimensions['C'].width = 18
+    ws_clash.column_dimensions['D'].width = 18
+    ws_clash.column_dimensions['E'].width = 50
 
     # ============================================================
     # SHEET: RESULT (split per ST — one sheet per size type)
@@ -1380,6 +1392,5 @@ def run_optimization(file_input):
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     total_rows = len(df_result_detail)
-    objective_value = int(pulp.value(prob.objective) or 0)
-    print(f"Done. Rows={total_rows}, Clashes={objective_value}")
-    return excel_buffer, total_rows, objective_value
+    print(f"Done. Rows={total_rows}, Total Clashes={total_clashes}")
+    return excel_buffer, total_rows, total_clashes
