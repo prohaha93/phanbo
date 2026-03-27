@@ -11,37 +11,81 @@ from ALLOCATION import run_optimization
 st.set_page_config(page_title="DISTRIBUTION CONTAINER", page_icon="🚢", layout="centered")
 st.markdown("""
     <style>
-        .main > div {
-            max-width: 800px;
-            margin: 0 auto;
+        /* ── Nền đen toàn trang ── */
+        html, body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stApp"],
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        .stApp { background-color: #000000 !important; }
+
+        .main > div { max-width: 800px; margin: 0 auto; }
+
+        /* ── Chữ trắng ── */
+        h1, h2, h3, p, label, div, span,
+        .stMarkdown, [data-testid="stMarkdownContainer"] {
+            color: #e8e8e8 !important;
         }
+
+        /* ── File uploader ── */
+        [data-testid="stFileUploader"] {
+            background-color: #111111 !important;
+            border: 1px solid #2a2a2a !important;
+            border-radius: 8px;
+        }
+
+        /* ── Nút bấm thường ── */
+        .stButton > button {
+            background-color: #0d1117 !important;
+            color: #58a6ff !important;
+            border: 1px solid #2a4a7f !important;
+            border-radius: 8px !important;
+        }
+        .stButton > button:hover {
+            background-color: #161b22 !important;
+            border-color: #4a8adf !important;
+        }
+
+        /* ── Info / Success / Error boxes ── */
+        [data-testid="stAlert"] {
+            background-color: #0d1117 !important;
+            border-color: #30363d !important;
+        }
+
+        /* ── Metric cards ── */
+        [data-testid="stMetric"] {
+            background-color: #0d1117 !important;
+            border: 1px solid #21262d !important;
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        /* ── Download button ── */
+        [data-testid="stDownloadButton"] > button {
+            background-color: #0f3460 !important;
+            color: #ffffff !important;
+            border: none !important;
+            border-radius: 8px !important;
+        }
+        [data-testid="stDownloadButton"] > button:hover {
+            background-color: #1a4f8a !important;
+        }
+
+        /* ── Timer box ── */
         .timer-box {
             display: flex;
             align-items: center;
             gap: 12px;
-            background: #f0f4ff;
-            border: 1px solid #c9d8f5;
+            background: #0d1117;
+            border: 1px solid #21262d;
             border-radius: 10px;
             padding: 14px 20px;
             margin-top: 8px;
         }
-        .timer-label {
-            color: #444;
-            font-size: 15px;
-            font-weight: 500;
-        }
-        .timer-value {
-            font-size: 28px;
-            font-weight: 700;
-            color: #1a56db;
-            font-variant-numeric: tabular-nums;
-            letter-spacing: 2px;
-        }
-        .spinner-msg {
-            color: #555;
-            font-size: 15px;
-            margin-bottom: 4px;
-        }
+        .timer-label  { color: #8b949e !important; font-size: 15px; font-weight: 500; }
+        .timer-value  { font-size: 28px; font-weight: 700; color: #58a6ff !important;
+                        font-variant-numeric: tabular-nums; letter-spacing: 2px; }
+        .spinner-msg  { color: #8b949e !important; font-size: 15px; margin-bottom: 4px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -58,10 +102,7 @@ if uploaded_file is not None:
 
     if st.button("🚀 CHẠY THUẬT TOÁN TỐI ƯU", use_container_width=True):
 
-        # --- Đọc bytes trước để tránh stream bị đóng khi chạy thread ---
         file_bytes = io.BytesIO(uploaded_file.read())
-
-        # --- Kết quả & lỗi được truyền qua dict dùng chung ---
         result_holder = {"done": False, "result": None, "error": None}
 
         def run_in_thread():
@@ -72,45 +113,36 @@ if uploaded_file is not None:
             finally:
                 result_holder["done"] = True
 
-        # --- Khởi động thread tính toán ---
         t = threading.Thread(target=run_in_thread, daemon=True)
         t.start()
         start_time = time.time()
 
-        # --- Khu vực hiển thị thông báo + đồng hồ ---
         st.markdown('<p class="spinner-msg">⏳ Hệ thống đang tính toán và xuất file... Vui lòng đợi!</p>',
                     unsafe_allow_html=True)
         timer_placeholder = st.empty()
 
-        # --- Vòng lặp cập nhật đồng hồ cho đến khi xong ---
         while not result_holder["done"]:
             elapsed = int(time.time() - start_time)
             mm, ss = divmod(elapsed, 60)
             timer_placeholder.markdown(
-                f"""
-                <div class="timer-box">
-                    <span class="timer-label">⏱ Thời gian tính toán:</span>
-                    <span class="timer-value">{mm:02d}:{ss:02d}</span>
-                </div>
-                """,
+                f"""<div class="timer-box">
+                      <span class="timer-label">⏱ Thời gian tính toán:</span>
+                      <span class="timer-value">{mm:02d}:{ss:02d}</span>
+                    </div>""",
                 unsafe_allow_html=True
             )
             time.sleep(0.5)
 
-        # --- Hiển thị thời gian cuối cùng (đứng yên) ---
         elapsed = int(time.time() - start_time)
         mm, ss = divmod(elapsed, 60)
         timer_placeholder.markdown(
-            f"""
-            <div class="timer-box" style="background:#f0fff4; border-color:#a3d9a5;">
-                <span class="timer-label">✅ Hoàn tất sau:</span>
-                <span class="timer-value" style="color:#1a7f37;">{mm:02d}:{ss:02d}</span>
-            </div>
-            """,
+            f"""<div class="timer-box" style="border-color:#1a3a2a; background:#0a1a0f;">
+                  <span class="timer-label">✅ Hoàn tất sau:</span>
+                  <span class="timer-value" style="color:#3fb950 !important;">{mm:02d}:{ss:02d}</span>
+                </div>""",
             unsafe_allow_html=True
         )
 
-        # --- Xử lý kết quả ---
         if result_holder["error"]:
             st.error(f"❌ Có lỗi xảy ra trong quá trình tính toán.\n\nChi tiết lỗi: {result_holder['error']}")
         else:
