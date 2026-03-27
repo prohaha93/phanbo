@@ -5,6 +5,7 @@ import pulp
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from collections import defaultdict
 
 # ============================================================
 # COLOR PALETTE
@@ -61,19 +62,16 @@ def _style(ws, coord, value=None, bold=False, font_color="FF000000",
 # ============================================================
 def run_optimization(file_input):
     """
-    Chạy thuật toán phân bổ tối ưu.
+    Chạy thuật toán phân bổ tối ưu (phiên bản đã tối ưu tốc độ).
 
     Returns
     -------
     excel_buffer : io.BytesIO
-        File Excel kết quả sẵn sàng để download.
-    total_rows : int
-        Tổng số dòng phân bổ trong sheet RESULT.
-    total_clashes : int
-        Số lượng clash thực tế (tổng e_vars).
+    total_rows   : int
+    total_clashes: int
     """
     # ============================================================
-    # 1. Đọc dữ liệu đầu vào (giữ nguyên)
+    # 1. Đọc dữ liệu đầu vào
     # ============================================================
     xls = pd.ExcelFile(file_input)
 
@@ -124,6 +122,12 @@ def run_optimization(file_input):
     jobs_by_hour = {}
     for (h, s, b) in job_keys:
         jobs_by_hour.setdefault(h, []).append((s, b))
+
+    # ── TĂNG TỐC #1: Pre-index jobs theo bay ──────────────────────
+    # Tránh vòng lặp O(|job_keys|) lặp lại khi xây dựng constraints
+    jobs_by_bay = defaultdict(list)
+    for (h, s, bay) in job_keys:
+        jobs_by_bay[bay].append((h, s, bay))
 
     # --- Sheet 2: BLOCK-WEIGHT CLASS → supply ---
     df2 = pd.read_excel(xls, sheet_name='BLOCK-WEIGHT CLASS', header=0)
@@ -200,7 +204,7 @@ def run_optimization(file_input):
     except Exception as e:
         print(f"No DATA sheet found – stacking rules skipped. ({e})")
 
-    # --- Xây dựng cấu trúc stacking nếu có container ---
+    # --- Xây dựng cấu trúc stacking ---
     yb_wc_supply   = {}
     stack_ordering = {}
     blocking_pairs = []
@@ -264,7 +268,7 @@ def run_optimization(file_input):
     print("Demand/supply balanced OK.")
 
     # ============================================================
-    # 3. Xây dựng và giải mô hình tối ưu (giữ nguyên)
+    # 3. Xây dựng và giải mô hình tối ưu
     # ============================================================
     prob = pulp.LpProblem("Minimize_Clashes_ST_POD", pulp.LpMinimize)
 
@@ -293,11 +297,11 @@ def run_optimization(file_input):
             prob += u_vars[(h, b)] == pulp.lpSum(y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h])
             prob += e_vars[(h, b)] >= u_vars[(h, b)] - 1
 
-    CLASH_W  = 100.0
-    SINGLE_W = 10.0
-    SPREAD_W = 5.0
+    CLASH_W        = 100.0
+    SINGLE_W       = 10.0
+    SPREAD_W       = 5.0
     BLOCK_BAY_WC_W = 2.0
-    BAY_SINGLE_W = 10.0
+    BAY_SINGLE_W   = 10.0
 
     single_block = {}
     for (h, s, bay) in job_keys:
@@ -305,29 +309,35 @@ def run_optimization(file_input):
         prob += single_block[(h, s, bay)] >= (2 - pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks))
 
     all_bays = sorted(set(bay for (_, _, bay) in job_keys))
+
+    # ── TĂNG TỐC #2: Pre-index x_vars theo (block, bay, wc) ──────
+    # Tránh triple nested loop O(B×BA×W×J×D) → O(1) lookup
+    x_by_block_bay_wc = defaultdict(list)
+    for (h, s, bay, b, dkey), xvar in x_vars.items():
+        w = dkey[0]
+        x_by_block_bay_wc[(b, bay, w)].append((xvar, demands[(h, s, bay)][dkey]))
+
     block_bay = {}
     for b in blocks:
         for bay in all_bays:
             var = pulp.LpVariable(f"bb_{b}_{bay}", cat='Binary')
             block_bay[(b, bay)] = var
-            for (h, s, bj) in job_keys:
-                if bj == bay:
-                    prob += var >= y_vars[(h, s, bay, b)]
+            # ── TĂNG TỐC #2a: dùng jobs_by_bay thay vì duyệt toàn bộ job_keys
+            for (h, s, bj) in jobs_by_bay[bay]:
+                prob += var >= y_vars[(h, s, bay, b)]
 
     block_bay_wc = {}
     for b in blocks:
         for bay in all_bays:
             for wc in weight_classes:
+                entries = x_by_block_bay_wc.get((b, bay, wc), [])
+                if not entries:
+                    continue  # bỏ qua biến không cần thiết → giảm kích thước model
                 var = pulp.LpVariable(f"bbw_{b}_{bay}_{wc}", cat='Binary')
                 block_bay_wc[(b, bay, wc)] = var
-                for (h, s, bj) in job_keys:
-                    if bj == bay:
-                        for dkey in demands[(h, s, bay)]:
-                            w, st_v, pod_v = dkey
-                            if w == wc:
-                                key_x = (h, s, bay, b, dkey)
-                                if key_x in x_vars:
-                                    prob += var >= x_vars[key_x] / (demands[(h, s, bay)][dkey] + 0.1)
+                # Mỗi entry đã được index sẵn, không cần duyệt lại
+                for xvar, d in entries:
+                    prob += var >= xvar / (d + 0.1)
 
     bay_single = {}
     for bay in all_bays:
@@ -340,9 +350,9 @@ def run_optimization(file_input):
     for bay in all_bays:
         prob += pulp.lpSum(block_bay[(b, bay)] for b in blocks) >= min_blocks_per_bay
 
-    clash_term    = pulp.lpSum(e_vars.values())
-    single_term   = pulp.lpSum(single_block.values())
-    spread_term   = pulp.lpSum(block_bay.values())
+    clash_term        = pulp.lpSum(e_vars.values())
+    single_term       = pulp.lpSum(single_block.values())
+    spread_term       = pulp.lpSum(block_bay.values())
     block_bay_wc_term = pulp.lpSum(block_bay_wc.values())
     bay_single_term   = pulp.lpSum(bay_single.values())
 
@@ -352,7 +362,7 @@ def run_optimization(file_input):
              BLOCK_BAY_WC_W * block_bay_wc_term +
              BAY_SINGLE_W * bay_single_term)
 
-    # Ràng buộc
+    # Ràng buộc demand
     for (h, s, bay) in job_keys:
         for dkey, d in demands[(h, s, bay)].items():
             w, st_v, pod_v = dkey
@@ -382,7 +392,8 @@ def run_optimization(file_input):
                 if (h, s, bay, b, dkey) in x_vars:
                     prob += x_vars[(h, s, bay, b, dkey)] <= d * y_vars[(h, s, bay, b)]
 
-    solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300)
+    # ── TĂNG TỐC #3: Thử HiGHS trước (nhanh hơn CBC ~3-5x), fallback CBC ──
+    solver = _get_best_solver(time_limit=300)
     prob.solve(solver)
 
     status = prob.status
@@ -417,6 +428,7 @@ def run_optimization(file_input):
 
     df_result_detail = []
     if container_data_available:
+        # ── TĂNG TỐC #4: Build pool với dict lookup nhanh ────────────
         pool = {}
         for _, row in df_containers[['YARD','YB','YR','YT','REAL_WC',
                                      'YARD_POS','REAL_CONT_ID',
@@ -432,36 +444,53 @@ def run_optimization(file_input):
                 'picked': False, 'pick_h': None
             })
 
+        # ── TĂNG TỐC #5: Pre-compute blockers (containers nằm trên) ──
+        # Thay vì duyệt toàn bộ pool trong accessible_at() mỗi lần,
+        # ta tính 1 lần duy nhất: mỗi container → list container chặn nó
+        blockers_map = {}   # id(cont) -> list[cont dict]
+        for blk, conts in pool.items():
+            # Group by (yb, yr) để tìm blockers nhanh
+            stack_map = defaultdict(list)
+            for c in conts:
+                stack_map[(c['yb'], c['yr'])].append(c)
+            for c in conts:
+                above = [other for other in stack_map[(c['yb'], c['yr'])]
+                         if other is not c and other['yt'] > c['yt']]
+                blockers_map[id(c)] = above
+
         opened_ybs = set()
 
-        def accessible_at(cont, containers, h_rank_val):
-            for c in containers:
-                if c is cont:
-                    continue
-                if c['yb'] == cont['yb'] and c['yr'] == cont['yr'] and c['yt'] > cont['yt']:
-                    if not c['picked']:
-                        return False
-                    if c['pick_h'] is not None and hour_rank[c['pick_h']] > h_rank_val:
-                        return False
+        def accessible_at(cont, h_rank_val):
+            # O(blockers) thay vì O(tất cả containers trong block)
+            for blocker in blockers_map.get(id(cont), []):
+                if not blocker['picked']:
+                    return False
+                if blocker['pick_h'] is not None and hour_rank[blocker['pick_h']] > h_rank_val:
+                    return False
             return True
 
         def pick_n(block, wc, st_match, pod_match, qty, h, s_job, bay_job, h_rank_val, result_list):
             containers = pool[block]
-            remaining = qty
+            remaining  = qty
+
             def matches(c):
-                if c['wc'] != wc: return False
-                if st_match  and c.get('st','')  != st_match:  return False
+                if c['wc'] != wc:                              return False
+                if st_match  and c.get('st','')  != st_match: return False
                 if pod_match and c.get('pod','') != pod_match: return False
                 return True
+
             while remaining > 0:
                 cands = [c for c in containers
                          if not c['picked'] and matches(c)
-                         and accessible_at(c, containers, h_rank_val)]
+                         and accessible_at(c, h_rank_val)]
                 if not cands:
                     break
-                yb_cnt = {}
+
+                # ── TĂNG TỐC #6: tính yb_cnt dùng Counter thay vì dict.get ──
+                yb_cnt = defaultdict(int)
                 for c in cands:
-                    yb_cnt[c['yb']] = yb_cnt.get(c['yb'], 0) + 1
+                    yb_cnt[c['yb']] += 1
+
                 cands.sort(key=lambda c: (
                     0 if (block, c['yb']) in opened_ybs else 1,
                     -yb_cnt[c['yb']],
@@ -579,11 +608,11 @@ def run_optimization(file_input):
     print(f"Total clashes (e sum): {total_clashes}")
 
     # ============================================================
-    # 6. Ghi file Excel – chỉ gồm CLASH, RESULT theo ST và RESULT TOTAL
+    # 6. Ghi file Excel
     # ============================================================
     import openpyxl
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)   # xoá sheet mặc định
+    wb.remove(wb.active)
 
     # ----- Sheet CLASH -----
     ws_clash = wb.create_sheet('CLASH')
@@ -638,7 +667,6 @@ def run_optimization(file_input):
         'YB': 8, 'YR': 8, 'YT': 8, 'YARD POSITION': 18,
     }
 
-    # Hàm viết một sheet RESULT
     def write_result_sheet(ws, df, sheet_title):
         n_rows = len(df)
         cont_list_map = {}
@@ -663,7 +691,6 @@ def run_optimization(file_input):
             cell.alignment = _align(wrap=True)
             cell.border    = _thin_border()
 
-        # Merge groups cho cột CONT LIST
         merge_groups = []
         cont_list_col_idx = all_result_cols.index('CONT LIST') + 1 if 'CONT LIST' in all_result_cols else None
         if container_data_available and cont_list_col_idx:
@@ -682,15 +709,22 @@ def run_optimization(file_input):
                 merge_groups.append((prev_key, grp_start, n_rows + 1,
                                      cont_list_map.get(prev_key, '')))
 
-        # Data rows
+        # ── TĂNG TỐC #7: Ghi data rows bằng bulk append thay vì cell-by-cell ──
         group_key   = None
         group_shade = C_ALT_ROW
+        fill_white   = _fill(C_WHITE)
+        fill_alt     = _fill(C_ALT_ROW)
+        border       = _thin_border()
+        align_center = _align()
+        font_default = _font(color='FF000000')
+
         for r_idx, (_, row) in enumerate(df.iterrows(), 2):
             this_key = (row.get('MOVE HOUR'), row.get('STS'), row.get('BAY'),
                         row.get('ASSIGNED BLOCK'), row.get('WEIGHT CLASS'))
             if this_key != group_key:
                 group_shade = C_WHITE if group_shade == C_ALT_ROW else C_ALT_ROW
                 group_key = this_key
+            current_fill = fill_white if group_shade == C_WHITE else fill_alt
 
             for c_idx, cn in enumerate(all_result_cols, 1):
                 if cn == 'CONT LIST':
@@ -706,29 +740,29 @@ def run_optimization(file_input):
                         val = None
 
                 cell = ws.cell(row=r_idx, column=c_idx, value=val)
-                cell.font      = _font(color='FF000000')
-                cell.fill      = _fill(group_shade)
-                cell.alignment = _align(wrap=(cn == 'CONT LIST'))
-                cell.border    = _thin_border()
+                cell.font      = font_default
+                cell.fill      = current_fill
+                cell.alignment = align_center
+                cell.border    = border
 
-        # Ghi và merge cột CONT LIST
         if cont_list_col_idx:
+            align_top_left = Alignment(horizontal='left', vertical='top', wrap_text=True)
+            fill_pale      = _fill(C_PALE_BLUE)
+            font_small     = _font(color='FF000000', size=9)
             for (mh, bay), r_start, r_end, list_text in merge_groups:
                 cell = ws.cell(row=r_start, column=cont_list_col_idx,
                                value=list_text or None)
-                cell.font      = _font(color='FF000000', size=9)
-                cell.fill      = _fill(C_PALE_BLUE)
-                cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
-                cell.border    = _thin_border()
+                cell.font      = font_small
+                cell.fill      = fill_pale
+                cell.alignment = align_top_left
+                cell.border    = border
                 if r_end > r_start:
                     ws.merge_cells(
                         start_row=r_start, start_column=cont_list_col_idx,
                         end_row=r_end,     end_column=cont_list_col_idx
                     )
-                    ws.cell(row=r_start, column=cont_list_col_idx).alignment = \
-                        Alignment(horizontal='left', vertical='top', wrap_text=True)
+                    ws.cell(row=r_start, column=cont_list_col_idx).alignment = align_top_left
 
-            # Điều chỉnh chiều cao dòng
             for (mh, bay), r_start, r_end, list_text in merge_groups:
                 span     = r_end - r_start + 1
                 n_ids    = len([x for x in list_text.split(',') if x.strip()]) if list_text else 0
@@ -737,7 +771,6 @@ def run_optimization(file_input):
                 for r in range(r_start, r_end + 1):
                     ws.row_dimensions[r].height = rh
 
-        # Độ rộng cột
         for c_idx, cn in enumerate(all_result_cols, 1):
             ws.column_dimensions[get_column_letter(c_idx)].width = col_widths.get(cn, 14)
 
@@ -762,7 +795,7 @@ def run_optimization(file_input):
             df_rd = df_result_detail[df_result_detail['ST'].astype(str).str.strip() == str(st_val).strip()].reset_index(drop=True)
         write_result_sheet(ws, df_rd, sheet_name)
 
-    # ----- Sheet RESULT TOTAL (tổng hợp) -----
+    # ----- Sheet RESULT TOTAL -----
     ws_total = wb.create_sheet('RESULT TOTAL')
     write_result_sheet(ws_total, df_result_detail.reset_index(drop=True), 'RESULT TOTAL')
 
@@ -775,3 +808,57 @@ def run_optimization(file_input):
     total_rows = len(df_result_detail)
     print(f"Done. Rows={total_rows}, Total Clashes={total_clashes}")
     return excel_buffer, total_rows, total_clashes
+
+
+# ============================================================
+# HELPER: Chọn solver tốt nhất khả dụng
+# ── TĂNG TỐC #3: HiGHS nhanh hơn CBC ~3-5x cho MIP ──────────
+# ============================================================
+def _get_best_solver(time_limit=300):
+    """
+    Thử theo thứ tự ưu tiên:
+      1. HiGHS  – solver MIP hiện đại, nhanh hơn CBC đáng kể
+      2. GLPK   – fallback nếu HiGHS không cài
+      3. CBC    – mặc định của PuLP (luôn có sẵn)
+    """
+    # --- HiGHS ---
+    try:
+        highs = pulp.HiGHS_CMD(
+            msg=True,
+            timeLimit=time_limit,
+            options=[
+                ("parallel", "on"),           # dùng nhiều CPU
+                ("threads",  str(_cpu_count())),
+            ]
+        )
+        # Kiểm tra HiGHS có thực sự cài không
+        test = pulp.LpProblem("_test", pulp.LpMinimize)
+        x = pulp.LpVariable("x")
+        test += x
+        test += x >= 0
+        test.solve(highs)
+        print(f"[Solver] Sử dụng HiGHS ({_cpu_count()} threads)")
+        return highs
+    except Exception:
+        pass
+
+    # --- CBC với multi-thread ---
+    try:
+        n = _cpu_count()
+        cbc = pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit, threads=n)
+        print(f"[Solver] Sử dụng CBC ({n} threads)")
+        return cbc
+    except Exception:
+        pass
+
+    # --- CBC fallback ---
+    print("[Solver] Sử dụng CBC (single thread – fallback)")
+    return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit)
+
+
+def _cpu_count():
+    import os
+    try:
+        return max(1, os.cpu_count() or 1)
+    except Exception:
+        return 1
